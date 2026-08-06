@@ -18,6 +18,8 @@ pub struct Options {}
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq)]
 pub struct TokenProperties(u8);
 
+const WINDOW: usize = 16;
+
 impl TokenProperties {
     const WORD_LIKE_MASK: u8 = 0b0000_0001;
     const NON_ASCII_MASK: u8 = 0b0000_0010;
@@ -53,6 +55,141 @@ impl std::ops::BitOrAssign for TokenProperties {
     #[inline]
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
+    }
+}
+
+// All the ascii break rules
+// 
+pub fn ascii_is_break(
+    previous2: WordBreakProperty, 
+    previous1: WordBreakProperty, 
+    current:WordBreakProperty, 
+    next: WordBreakProperty
+) -> bool {
+    // We will check all non breaking rules and then invert that so we break in all other cases
+    // All non breaking rules that only have ascii
+    // WB3 - Do not break within CRLF. CR × LF
+    // WB3d - Keep horizontal whitespace together.
+    // WB5 - Do not break between most letters. AHLetter × AHLetter
+    // Do not break letters across certain punctuation, such as within “e.g.” or “example.com”.
+    // WB6 - AHLetter × (MidLetter | MidNumLetQ) AHLetter
+    // WB7 - AHLetter (MidLetter | MidNumLetQ) × AHLetter
+    // Do not break within sequences of digits, or digits adjacent to letters (“3a”, or “A3”).
+    // WB8 - Numeric × Numeric
+    // WB9 - AHLetter ×	Numeric
+    // WB10 - Numeric ×	AHLetter
+    // Do not break within sequences, such as “3.2” or “3,456.789”.
+    // WB11 - Numeric (MidNum | MidNumLetQ)	×	Numeric
+    // WB12 - Numeric	×	(MidNum | MidNumLetQ) Numeric
+    // Do not break from extenders.
+    // WB13a - (AHLetter | Numeric | ExtendNumLet) × ExtendNumLet
+    // WB13b - ExtendNumLet	× (AHLetter | Numeric)
+    let do_not_break = (previous1 == WordBreakProperty::CR) & (current == WordBreakProperty::LF) // WB3
+        | (previous1 == WordBreakProperty::WSegSpace) & (current == WordBreakProperty::WSegSpace) // WB3d
+        | (previous1 == WordBreakProperty::ALetter) & (current == WordBreakProperty::ALetter) // WB5
+        | ((previous1 == WordBreakProperty::ALetter) 
+        & (current == WordBreakProperty::MidLetter || current == WordBreakProperty::MidNumLet)
+        & (next == WordBreakProperty::ALetter)) // WB6
+        | ((previous2 == WordBreakProperty::ALetter) 
+        & (previous1 == WordBreakProperty::MidLetter || previous1 == WordBreakProperty::MidNumLet)
+        & (current == WordBreakProperty::ALetter)) // WB7
+        | (previous1 == WordBreakProperty::Numeric) & (current == WordBreakProperty::Numeric) // WB8
+        | (previous1 == WordBreakProperty::ALetter) & (current == WordBreakProperty::Numeric) // WB9
+        | (previous1 == WordBreakProperty::Numeric) & (current == WordBreakProperty::ALetter) // WB10
+        | ((previous2 == WordBreakProperty::Numeric) 
+        & (previous1 == WordBreakProperty::MidNum || previous1 == WordBreakProperty::MidNumLet)
+        & (current == WordBreakProperty::Numeric)) // WB11
+        | ((previous1 == WordBreakProperty::Numeric) 
+        & (current == WordBreakProperty::MidNum || current == WordBreakProperty::MidNumLet)
+        & (next == WordBreakProperty::Numeric)) // WB12
+        | (matches!(previous1, WordBreakProperty::ALetter | WordBreakProperty::Numeric | WordBreakProperty::ExtendNumLet)
+        & (current == WordBreakProperty::ExtendNumLet)) // WB13a
+        | (previous1 == WordBreakProperty::ExtendNumLet) & matches!(current, WordBreakProperty::ALetter | WordBreakProperty::Numeric) //WB13b
+        ;
+    !do_not_break 
+}
+
+pub struct WindowTokens {
+    pub breaks: u16
+}
+
+pub fn process_window(bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+    let mut breaks: u16 = 0;
+    let byte_window: &[u8; WINDOW] = bytes.get(pos..pos + WINDOW)?.try_into().ok()?;
+    let mut classes = [WordBreakProperty::Other; WINDOW];
+
+    // TODO: should we fuse the two loops ?
+    for i in 0..WINDOW {
+        let b = byte_window[i];
+        if b >= 0x80 {
+            return None;
+        }
+        classes[i] = ASCII_WORD_BREAK_PROP[byte_window[i] as usize];
+    }
+    
+    for i in 0..WINDOW {
+        let previous2 = if i > 1 {classes[i - 2]} else {WordBreakProperty::Other};
+        let previous1 = if i > 0 {classes[i - 1]} else {WordBreakProperty::Other};
+        let current = classes[i];
+        let next = if i + 1 < WINDOW {classes[i+1]} else {WordBreakProperty::Other};
+        let does_break = ascii_is_break(previous2, previous1, current, next);
+        breaks |= (does_break as u16) << i;
+    }
+
+    Some(WindowTokens{breaks:breaks})
+}
+
+pub fn tokenize_windowed(
+    text: &str,
+    _options: Options,
+    mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let bytes = text.as_bytes();
+
+    let mut state = State::StartOfText;
+    let mut deferred_break_pos = None;
+    let mut pos = 0;
+
+    let mut last_was_zwj = false;
+    let mut token_props = TokenProperties::default();
+    let mut deferred_props = TokenProperties::default();
+
+    while pos < text.len() {
+        if pos >= 1 && pos + WINDOW < bytes.len() {
+            // do a batch
+            process_window(bytes, pos);    
+        } else {
+            // do a scalar loop - this handles the head and tail that can't fit into a batch
+            if matches!(
+                state,
+                State::ALetter | State::Numeric | State::ExtendNumLet | State::HLetter
+            ) {
+                let scan_start = pos;
+                let mut fast_acc: u8 = 0;
+                while pos < text.len() && bytes[pos] < 0x80 {
+                    let info = ASCII_BYTE_INFO[bytes[pos] as usize];
+                    if info & ASCII_WORD_CONTINUE == 0 {
+                        break;
+                    }
+                    fast_acc |= info;
+                    pos += 1;
+                }
+                if pos > scan_start {
+                    token_props.0 |= fast_acc & !ASCII_WORD_CONTINUE;
+                    let last = bytes[pos - 1]; // Safe because we're not in State::StartOfText.
+                    state = match last {
+                        b'0'..=b'9' => State::Numeric,
+                        b'_' => State::ExtendNumLet,
+                        _ => State::ALetter,
+                    };
+                    last_was_zwj = false;
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -294,6 +431,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tokenizer_simple_test() {
+        fn assert_breaks(s: &str, expected: Vec<usize>) {
+            let mut breakpoints = Vec::new();
+            tokenize(s, Options::default(), |bp, _props| {
+                breakpoints.push(bp);
+                true
+            });
+            assert_eq!(breakpoints, expected, "input: {:?}", s);
+        }
+
+        assert_breaks("3.14", vec![0,1,4,5]);
+    }
+    
     #[test]
     fn tokenizer_sanity() {
         fn assert_breaks(s: &str, expected: Vec<usize>) {
