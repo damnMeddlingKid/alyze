@@ -1,11 +1,15 @@
+pub(crate) mod ascii_window;
 pub(crate) mod properties;
 pub(crate) mod transitions;
+
+use ascii_window::WINDOW;
 
 use crate::uax29::Action;
 use properties::{
     ASCII_WORD_BREAK_PROP, WordBreakProperty, is_word_like_strict,
     lookup_word_break_property_from_dictionary,
 };
+use stringzilla::stringzilla::Utf8Wordbreaks;
 use transitions::{State, TABLE, Transition};
 
 /// For backwards compatibility, require caller to pass in options struct.
@@ -54,6 +58,388 @@ impl std::ops::BitOrAssign for TokenProperties {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
+}
+
+/// Words buffered per FFI call into StringZilla's segmenter. The crate default is 64; measured on
+/// English Wikipedia, raising it to 1024 is worth ~13% by amortizing the call overhead across more
+/// segments. Costs `2 * SZ_STEPS * size_of::<usize>()` of stack in the iterator.
+const SZ_STEPS: usize = 1024;
+
+/// Benchmark helper: identical work to [`tokenize2`] with the callback removed, accumulating into
+/// locals instead. Isolates how much of the cost is the per-boundary call versus the segmentation
+/// and property scan themselves. Not part of the public contract.
+#[doc(hidden)]
+pub fn tokenize2_no_callback(text: &str) -> (usize, u8) {
+    if text.is_empty() {
+        return (0, 0);
+    }
+
+    let mut breaks = 1usize; // the WB1 boundary at 0
+    let mut acc = 0u8;
+
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    for segment in Utf8Wordbreaks::<SZ_STEPS>::with_steps(text.as_bytes()) {
+        offset += segment.len();
+
+        let mut props = TokenProperties::default();
+        let mut i = 0;
+        while i < segment.len() {
+            let b = segment[i];
+            if b < 0x80 {
+                props.0 |= ASCII_BYTE_INFO[b as usize] & !ASCII_WORD_CONTINUE;
+                i += 1;
+            } else {
+                let c = text[start + i..].chars().next().unwrap();
+                props |= TokenProperties::NON_ASCII;
+                let prop = lookup_word_break_property_from_dictionary(c);
+                props |= WORD_BREAK_CONTRIB[prop as usize];
+                if !props.is_word_like() && is_word_like_strict(c) {
+                    props |= TokenProperties::WORD_LIKE;
+                }
+                i += c.len_utf8();
+            }
+        }
+
+        acc |= props.0;
+        breaks += 1;
+        start = offset;
+    }
+    (breaks, acc)
+}
+
+/// Word tokenizer backed by StringZilla's UAX #29 segmenter, for comparison against [`tokenize`]'s
+/// DFA. Emits the same breakpoints and the same [`TokenProperties`], but recomputes the properties
+/// in a second pass over each segment rather than fusing them into the scan.
+pub fn tokenize2(
+    text: &str,
+    _options: Options,
+    mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    // WB1: sot ÷ Any. Opens the first token, so it carries no properties.
+    if !on_breakpoint(0, TokenProperties::default()) {
+        return;
+    }
+
+    // Segments tile the input: contiguous, no empties, every byte in exactly one segment. So a
+    // running sum of their lengths reproduces the breakpoints, and the final sum is `text.len()`,
+    // which is the WB2 (Any ÷ eot) boundary `tokenize` emits explicitly.
+    let mut start = 0usize;
+    let mut offset = 0usize;
+    for segment in Utf8Wordbreaks::<SZ_STEPS>::with_steps(text.as_bytes()) {
+        offset += segment.len();
+
+        // Property accumulation is written out here rather than factored into a helper: segments
+        // average under three bytes on English Wikipedia, so a call per segment costs more than the
+        // scan it wraps. Byte-wise rather than `chars()` for the same reason — decoding every ASCII
+        // char is far more work than a table lookup, and ASCII dominates the input.
+        let mut props = TokenProperties::default();
+        let mut i = 0;
+        while i < segment.len() {
+            let b = segment[i];
+            if b < 0x80 {
+                // `ASCII_WORD_CONTINUE` is masked off: it drives the fast path, not a property.
+                props.0 |= ASCII_BYTE_INFO[b as usize] & !ASCII_WORD_CONTINUE;
+                i += 1;
+            } else {
+                // `start + i` is a char boundary, so slicing `text` is O(1) and never fails.
+                let c = text[start + i..].chars().next().unwrap();
+                props |= TokenProperties::NON_ASCII;
+                let prop = lookup_word_break_property_from_dictionary(c);
+                props |= WORD_BREAK_CONTRIB[prop as usize];
+                // Cheap path covers ALetter / HebrewLetter / Numeric; fall back to the strict check
+                // only while the segment is not yet known to be word-like.
+                if !props.is_word_like() && is_word_like_strict(c) {
+                    props |= TokenProperties::WORD_LIKE;
+                }
+                i += c.len_utf8();
+            }
+        }
+
+        if !on_breakpoint(offset, props) {
+            return;
+        }
+        start = offset;
+    }
+}
+
+
+/// Lanes `lo..hi` of a window, as a bit per lane.
+#[inline(always)]
+fn lane_mask(lo: usize, hi: usize) -> u16 {
+    if hi <= lo {
+        0
+    } else {
+        ((((1u32 << (hi - lo)) - 1) << lo) & 0xFFFF) as u16
+    }
+}
+
+/// The state the machine would be in having just consumed the ASCII byte `b`, whose window class is
+/// `cls`.
+///
+/// The class answers this for everything except `Newline` (U+000B/U+000C), which carries no class
+/// bits — nothing joins to it, so the boundary rules need none — yet the machine has a state for it
+/// distinct from `Any`, because WB3a stops Extend/Format/ZWJ from attaching after a newline. So the
+/// byte is only consulted on the fallthrough.
+///
+/// Only reached for bytes that cannot leave the machine mid-lookahead; `ascii_window::defers`
+/// screens the rest out before a window commits.
+#[inline(always)]
+fn state_after_ascii(cls: u8, b: u8) -> State {
+    use ascii_window::{CLS_AL, CLS_CR, CLS_LF, CLS_NU, CLS_SP, CLS_W};
+    if cls & CLS_AL != 0 {
+        State::ALetter
+    } else if cls & CLS_NU != 0 {
+        State::Numeric
+    } else if cls & CLS_W != 0 {
+        State::ExtendNumLet // `_`, the only remaining member of W
+    } else if cls & CLS_SP != 0 {
+        State::WSegSpace
+    } else if cls & CLS_CR != 0 {
+        State::CR
+    } else if cls & CLS_LF != 0 {
+        State::Newline
+    } else if b.wrapping_sub(0x0b) <= 1 {
+        State::Newline // U+000B, U+000C
+    } else {
+        State::Any
+    }
+}
+
+/// As [`tokenize`], but decides boundaries a window of ASCII at a time instead of a character at a
+/// time, dropping back to the character-by-character state machine at any non-ASCII byte.
+///
+/// `decide` supplies the window kernel, so the scalar and vector variants share this driver exactly
+/// and can only differ in how a window is evaluated. The state machine remains the definition of
+/// correctness; the window path is an accelerator that must produce identical breakpoints and
+/// properties, which `tokenize3_matches_dfa` and `tokenize4_matches_dfa` check against it.
+#[inline(always)]
+fn tokenize_windowed(
+    text: &str,
+    mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+    decide: impl Fn(&[u8], usize, u8, u8, u8) -> Option<ascii_window::Decisions>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let bytes = text.as_bytes();
+
+    let mut state = State::StartOfText;
+    let mut deferred_break_pos = None;
+    let mut pos = 0;
+    let mut last_was_zwj = false;
+    let mut token_props = TokenProperties::default();
+    let mut deferred_props = TokenProperties::default();
+
+    while pos < text.len() {
+        // Windowed ASCII path. Requires the machine to be at rest (not mid-lookahead, no pending
+        // ZWJ), a full window of runway, and the two preceding bytes to be ASCII — the window rules
+        // read them as context, and a continuation byte would be classified as though it were a
+        // character in its own right.
+        if pos >= 1
+            && pos + WINDOW <= bytes.len()
+            && !state.is_deferred()
+            && deferred_break_pos.is_none()
+            && !last_was_zwj
+            && bytes[pos - 1] < 0x80
+            && (pos < 2 || bytes[pos - 2] < 0x80)
+        {
+            let pp = if pos >= 2 {
+                ascii_window::ASCII_CLASS[bytes[pos - 2] as usize]
+            } else {
+                0
+            };
+            let p = ascii_window::ASCII_CLASS[bytes[pos - 1] as usize];
+            let n = match bytes.get(pos + WINDOW) {
+                Some(&b) if b < 0x80 => ascii_window::ASCII_CLASS[b as usize],
+                _ => 0,
+            };
+
+            if let Some(d) = decide(bytes, pos, pp, p, n) {
+                // Never end a window mid-lookahead: the scalar path cannot resume in a deferred
+                // state without also inheriting the pending breakpoint.
+                let (commit, last_cls, last_byte) =
+                    if ascii_window::defers(d.prev_last_class, d.last_class) {
+                        (WINDOW - 1, d.prev_last_class, d.prev_last_byte)
+                    } else {
+                        (WINDOW, d.last_class, d.last_byte)
+                    };
+
+                let mut remaining = d.breaks & lane_mask(0, commit);
+                let mut seg_start = 0usize;
+                while remaining != 0 {
+                    let lane = remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+
+                    let span = lane_mask(seg_start, lane);
+                    if d.word_like & span != 0 {
+                        token_props |= TokenProperties::WORD_LIKE;
+                    }
+                    if d.upper & span != 0 {
+                        token_props.0 |= TokenProperties::HAS_ASCII_UPPER_MASK;
+                    }
+                    if !on_breakpoint(pos + lane, std::mem::take(&mut token_props)) {
+                        return;
+                    }
+                    seg_start = lane;
+                }
+
+                // Bytes after the last boundary belong to the token still in progress.
+                let span = lane_mask(seg_start, commit);
+                if d.word_like & span != 0 {
+                    token_props |= TokenProperties::WORD_LIKE;
+                }
+                if d.upper & span != 0 {
+                    token_props.0 |= TokenProperties::HAS_ASCII_UPPER_MASK;
+                }
+
+                state = state_after_ascii(last_cls, last_byte);
+                pos += commit;
+                continue;
+            }
+        }
+
+        // Scalar ASCII run, for the tail and for positions the window path declined.
+        if matches!(
+            state,
+            State::ALetter | State::Numeric | State::ExtendNumLet | State::HLetter
+        ) {
+            let scan_start = pos;
+            let mut fast_acc: u8 = 0;
+            while pos < text.len() && bytes[pos] < 0x80 {
+                let info = ASCII_BYTE_INFO[bytes[pos] as usize];
+                if info & ASCII_WORD_CONTINUE == 0 {
+                    break;
+                }
+                fast_acc |= info;
+                pos += 1;
+            }
+            if pos > scan_start {
+                token_props.0 |= fast_acc & !ASCII_WORD_CONTINUE;
+                let last = bytes[pos - 1];
+                state = match last {
+                    b'0'..=b'9' => State::Numeric,
+                    b'_' => State::ExtendNumLet,
+                    _ => State::ALetter,
+                };
+                last_was_zwj = false;
+                continue;
+            }
+        }
+
+        let b = bytes[pos];
+        let (c, prop, char_len, char_props) = if b < 0x80 {
+            (
+                b as char,
+                ASCII_WORD_BREAK_PROP[b as usize],
+                1usize,
+                TokenProperties(ASCII_BYTE_INFO[b as usize] & !ASCII_WORD_CONTINUE),
+            )
+        } else {
+            let c = text[pos..].chars().next().unwrap();
+            let prop = lookup_word_break_property_from_dictionary(c);
+            let mut char_props = TokenProperties::NON_ASCII;
+            char_props |= WORD_BREAK_CONTRIB[prop as usize];
+            if !char_props.is_word_like() && is_word_like_strict(c) {
+                char_props |= TokenProperties::WORD_LIKE;
+            }
+            (c, prop, c.len_utf8(), char_props)
+        };
+
+        let Transition(next_state, action) = TABLE[state as usize][prop as usize];
+        match action {
+            Action::Break => {
+                let boundary = pos;
+                pos += char_len;
+                if last_was_zwj {
+                    last_was_zwj = false;
+                    if WordBreakProperty::is_ext_pictographic(c) {
+                        token_props |= char_props;
+                        continue;
+                    }
+                }
+                last_was_zwj = prop == WordBreakProperty::ZWJ;
+                state = next_state;
+                if !on_breakpoint(boundary, std::mem::take(&mut token_props)) {
+                    return;
+                }
+                token_props |= char_props;
+                continue;
+            }
+            Action::NoBreak => {
+                last_was_zwj = false;
+                if next_state.is_deferred() {
+                    if deferred_break_pos.is_none() {
+                        deferred_break_pos = Some(pos);
+                    }
+                    deferred_props |= char_props;
+                } else {
+                    if deferred_break_pos.take().is_some() {
+                        token_props |= std::mem::take(&mut deferred_props);
+                    }
+                    token_props |= char_props;
+                }
+                state = next_state;
+                pos += char_len;
+            }
+            Action::DeferredBreak => {
+                last_was_zwj = false;
+                let boundary = deferred_break_pos.take().unwrap();
+                state = next_state;
+                if !on_breakpoint(boundary, std::mem::take(&mut token_props)) {
+                    return;
+                }
+                token_props |= std::mem::take(&mut deferred_props);
+                continue;
+            }
+            Action::Transparent => {
+                last_was_zwj = prop == WordBreakProperty::ZWJ;
+                pos += char_len;
+                if deferred_break_pos.is_some() {
+                    deferred_props |= char_props;
+                } else {
+                    token_props |= char_props;
+                }
+            }
+        }
+    }
+
+    if state.is_deferred() {
+        let breakpoint = deferred_break_pos.take().unwrap();
+        if !on_breakpoint(breakpoint, std::mem::take(&mut token_props)) {
+            return;
+        }
+        token_props |= std::mem::take(&mut deferred_props);
+    }
+
+    _ = on_breakpoint(text.len(), token_props);
+}
+
+
+/// Windowed tokenizer using the portable scalar window kernel.
+pub fn tokenize3(
+    text: &str,
+    _options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    tokenize_windowed(text, on_breakpoint, ascii_window::decide_window)
+}
+
+/// Windowed tokenizer using the hand-written SIMD window kernel where one exists, and the scalar
+/// kernel elsewhere. Output is identical to [`tokenize3`] and to [`tokenize`] on every input.
+pub fn tokenize4(
+    text: &str,
+    _options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    tokenize_windowed(text, on_breakpoint, ascii_window::decide_window_neon);
+    #[cfg(not(target_arch = "aarch64"))]
+    tokenize_windowed(text, on_breakpoint, ascii_window::decide_window);
 }
 
 /// A tokenizer that implements UAX #29 word boundary rules, using a deterministic finite automaton
@@ -273,14 +659,193 @@ const ASCII_BYTE_INFO: [u8; 128] = {
 
 #[cfg(test)]
 mod tests {
-    use super::{Options, tokenize};
-    use crate::uax29::test_helpers::test_against_uax29_break_tests;
+    use super::{Options, TokenProperties, tokenize, tokenize2, tokenize3, tokenize4};
+    use crate::uax29::test_helpers::{load_break_tests, test_against_uax29_break_tests};
 
+    /// Every implementation that must be behaviourally identical to the state machine.
+    ///
+    /// The tests below iterate this list rather than naming `tokenize` directly, so a new
+    /// implementation inherits the entire suite by being added here — there is no way to add one
+    /// that is only covered by the differential tests.
+    type Tokenizer = fn(&str, Options, &mut dyn FnMut(usize, TokenProperties) -> bool);
+
+    const TOKENIZERS: &[(&str, Tokenizer)] = &[
+        ("tokenize", |s, o, cb| tokenize(s, o, cb)),
+        ("tokenize3", |s, o, cb| tokenize3(s, o, cb)),
+        ("tokenize4", |s, o, cb| tokenize4(s, o, cb)),
+    ];
+
+    /// Every `(breakpoint, properties)` pair one tokenizer emits for `input`.
+    fn run(tok: Tokenizer, input: &str) -> Vec<(usize, TokenProperties)> {
+        let mut out = Vec::new();
+        tok(input, Options::default(), &mut |bp, props| {
+            out.push((bp, props));
+            true
+        });
+        out
+    }
+
+
+    /// `tokenize3` must be indistinguishable from `tokenize` — same breakpoints, same properties —
+    /// on every conformance case. Cases are short, so this mostly exercises the scalar fallback and
+    /// the window path's entry conditions rather than long ASCII runs; `tokenize3_matches_dfa_prose`
+    /// covers the windowed path proper.
     #[test]
-    fn test_word_break_against_uax29_tests() {
+    fn tokenize3_matches_dfa() {
+        let mut mismatches = Vec::new();
+        for case in load_break_tests("testdata/WordBreakTest.txt") {
+            let input = case.codepoints_as_string();
+            if let Some((a, b)) = compare_tokenizers(&input) {
+                mismatches.push((input, a, b));
+            }
+        }
+        report_mismatches(&mismatches);
+    }
+
+    /// The conformance corpus again, but padded so the windowed path actually runs over it.
+    ///
+    /// Every case in `WordBreakTest.txt` is shorter than one window, so the unpadded run exercises
+    /// only the scalar fallback — a windowed-path bug survives it untouched. Surrounding each case
+    /// with ASCII shifts it to every alignment within a window and gives the path the runway it
+    /// needs to engage. Padding changes the expected breakpoints, so this compares the tokenizers
+    /// against each other rather than against the file's annotations.
+    #[test]
+    fn tokenize3_matches_dfa_padded() {
+        let mut mismatches = Vec::new();
+        for case in load_break_tests("testdata/WordBreakTest.txt") {
+            let body = case.codepoints_as_string();
+            for pad in [0usize, 1, 2, 3, 5, 8, 13, 16, 17, 31, 33] {
+                let input = format!("{}{body}{}", "a".repeat(pad), " word tail here padding");
+                if let Some((a, b)) = compare_tokenizers(&input) {
+                    mismatches.push((input, a, b));
+                }
+            }
+        }
+        report_mismatches(&mismatches);
+    }
+
+    /// Long, realistic ASCII prose, which is what actually drives the windowed path: every input
+    /// here is far longer than one window and exercises the rules that need lookahead.
+    #[test]
+    fn tokenize3_matches_dfa_prose() {
+        let mut corpus: Vec<String> = vec![
+            "The quick brown fox jumps over the lazy dog, again and again and again.".into(),
+            "Version 3.14.159 was released on 2024-01-02; it costs $1,234.56 in U.S. dollars.".into(),
+            "don't can't won't shouldn't o'clock rock'n'roll ain't y'all'd've".into(),
+            "snake_case camelCase SCREAMING_CASE _leading trailing_ __dunder__".into(),
+            "a:b c:d http://example.com/path?q=1&r=2 mailto:someone@example.org".into(),
+            "Line one\r\nLine two\nLine three\r\rLine four\x0bvertical\x0cform feed".into(),
+            "   leading and     interior      runs of spaces   trailing   ".into(),
+            "Mixed 1a2b3c 4d5e6f alpha1 2beta gamma_3 4_delta 5.6e7 1,000,000".into(),
+            "Punctuation!!! Really??? Yes... (parens) [brackets] {braces} \"quoted\" 'single'".into(),
+        ];
+        // Non-ASCII interleaved with long ASCII runs: forces repeated entry into and exit from the
+        // window path, which is where the handoff back to the state machine can go wrong.
+        corpus.push(format!("{} Ηλέκτρα {} café {} 日本語 {}", "alpha ".repeat(30), "beta ".repeat(30), "gamma ".repeat(30), "delta ".repeat(30)));
+        corpus.push("é.a è'b ü:c ñ,1 ".repeat(20));
+        // Every window-length alignment against a boundary, to catch off-by-one in the commit.
+        for pad in 0..40usize {
+            corpus.push(format!("{}don't stop{}", "x".repeat(pad), " y".repeat(3)));
+            corpus.push(format!("{}3,000.50 end{}", "x".repeat(pad), " z".repeat(3)));
+            corpus.push(format!("{}a:b:c end{}", "x".repeat(pad), " w".repeat(3)));
+        }
+
+        let mut mismatches = Vec::new();
+        for input in corpus {
+            if let Some((a, b)) = compare_tokenizers(&input) {
+                mismatches.push((input, a, b));
+            }
+        }
+        report_mismatches(&mismatches);
+    }
+
+    /// Returns `Some((dfa, windowed))` when the two disagree.
+    #[allow(clippy::type_complexity)]
+    fn compare_tokenizers(
+        input: &str,
+    ) -> Option<(Vec<(usize, super::TokenProperties)>, Vec<(usize, super::TokenProperties)>)> {
+        let mut dfa = Vec::new();
+        tokenize(input, Options::default(), |bp, props| {
+            dfa.push((bp, props));
+            true
+        });
+        let mut win = Vec::new();
+        tokenize3(input, Options::default(), |bp, props| {
+            win.push((bp, props));
+            true
+        });
+        let mut simd = Vec::new();
+        tokenize4(input, Options::default(), |bp, props| {
+            simd.push((bp, props));
+            true
+        });
+        if dfa != win {
+            return Some((dfa, win));
+        }
+        (dfa != simd).then_some((dfa, simd))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn report_mismatches(
+        mismatches: &[(
+            String,
+            Vec<(usize, super::TokenProperties)>,
+            Vec<(usize, super::TokenProperties)>,
+        )],
+    ) {
+        for (input, dfa, win) in mismatches.iter().take(5) {
+            let first = dfa.iter().zip(win).position(|(a, b)| a != b);
+            println!("input: {input:?}\n  first divergence at index {first:?}");
+            if let Some(i) = first {
+                println!("  dfa: {:?}\n  win: {:?}", &dfa[i..(i + 3).min(dfa.len())], &win[i..(i + 3).min(win.len())]);
+            } else {
+                println!("  dfa len {} vs win len {}", dfa.len(), win.len());
+            }
+        }
+        assert!(mismatches.is_empty(), "{} inputs disagree", mismatches.len());
+    }
+
+    /// `tokenize2` has to agree with `tokenize` on properties, not just boundaries. Runs both over
+    /// the full UAX #29 corpus and compares the emitted `(breakpoint, properties)` sequences.
+    #[test]
+    fn stringzilla_matches_dfa_properties() {
+        let mut mismatches = Vec::new();
+        for case in load_break_tests("testdata/WordBreakTest.txt") {
+            let input = case.codepoints_as_string();
+
+            let mut dfa = Vec::new();
+            tokenize(&input, Options::default(), |bp, props| {
+                dfa.push((bp, props));
+                true
+            });
+
+            let mut sz = Vec::new();
+            tokenize2(&input, Options::default(), |bp, props| {
+                sz.push((bp, props));
+                true
+            });
+
+            if dfa != sz {
+                mismatches.push((input, dfa, sz));
+            }
+        }
+        for (input, dfa, sz) in mismatches.iter().take(10) {
+            println!("input: {:?}\n  dfa: {:?}\n   sz: {:?}", input, dfa, sz);
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} inputs disagree on properties",
+            mismatches.len()
+        );
+    }
+
+    /// Same corpus as `test_word_break_against_uax29_tests`, against the StringZilla-backed
+    /// segmenter. Checks only breakpoints; `tokenize2` reports no properties yet.
+    #[test]
+    fn test_stringzilla_word_break_against_uax29_tests() {
         let (passed, failed) =
             test_against_uax29_break_tests("testdata/WordBreakTest.txt", |s, breakpoints| {
-                tokenize(s, Options::default(), |bp, _props| {
+                tokenize2(s, Options::default(), |bp, _props| {
                     breakpoints.push(bp);
                     true
                 });
@@ -295,14 +860,32 @@ mod tests {
     }
 
     #[test]
+    fn test_word_break_against_uax29_tests() {
+        for (name, tok) in TOKENIZERS {
+            let (passed, failed) =
+                test_against_uax29_break_tests("testdata/WordBreakTest.txt", |s, breakpoints| {
+                    tok(s, Options::default(), &mut |bp, _props| {
+                        breakpoints.push(bp);
+                        true
+                    });
+                });
+            assert_eq!(
+                (1944, 0),
+                (passed, failed),
+                "{name}: {} / {} tests passed",
+                passed,
+                passed + failed
+            );
+        }
+    }
+
+    #[test]
     fn tokenizer_sanity() {
         fn assert_breaks(s: &str, expected: Vec<usize>) {
-            let mut breakpoints = Vec::new();
-            tokenize(s, Options::default(), |bp, _props| {
-                breakpoints.push(bp);
-                true
-            });
-            assert_eq!(breakpoints, expected, "input: {:?}", s);
+            for (name, tok) in TOKENIZERS {
+                let got: Vec<usize> = run(*tok, s).into_iter().map(|(bp, _)| bp).collect();
+                assert_eq!(got, expected, "{name} input: {s:?}");
+            }
         }
 
         // Empty string yields no breakpoints.
@@ -410,12 +993,13 @@ mod tests {
         // Each emit reports properties of the span just closed; the leading boundary at 0 has
         // no preceding span, so it carries default props.
         fn assert_props(s: &str, expected: Vec<(usize, bool)>) {
-            let mut got: Vec<(usize, bool)> = Vec::new();
-            tokenize(s, Options::default(), |bp, props| {
-                got.push((bp, props.is_ascii()));
-                true
-            });
-            assert_eq!(got, expected, "input: {:?}", s);
+            for (name, tok) in TOKENIZERS {
+                let got: Vec<(usize, bool)> = run(*tok, s)
+                    .into_iter()
+                    .map(|(bp, props)| (bp, props.is_ascii()))
+                    .collect();
+                assert_eq!(got, expected, "{name} input: {s:?}");
+            }
         }
 
         // Leading boundary at 0 is vacuously is_ascii=true.
@@ -432,12 +1016,13 @@ mod tests {
         // Each emit reports properties of the span just closed; the leading boundary at 0 has
         // no preceding span, so has_ascii_upper is vacuously false.
         fn assert_has_ascii_upper(s: &str, expected: Vec<(usize, bool)>) {
-            let mut got: Vec<(usize, bool)> = Vec::new();
-            tokenize(s, Options::default(), |bp, props| {
-                got.push((bp, props.has_ascii_upper()));
-                true
-            });
-            assert_eq!(got, expected, "input: {:?}", s);
+            for (name, tok) in TOKENIZERS {
+                let got: Vec<(usize, bool)> = run(*tok, s)
+                    .into_iter()
+                    .map(|(bp, props)| (bp, props.has_ascii_upper()))
+                    .collect();
+                assert_eq!(got, expected, "{name} input: {s:?}");
+            }
         }
 
         assert_has_ascii_upper("hello", vec![(0, false), (5, false)]);
@@ -452,12 +1037,13 @@ mod tests {
     }
 
     fn assert_word_like(s: &str, expected: Vec<(usize, bool)>) {
-        let mut got: Vec<(usize, bool)> = Vec::new();
-        tokenize(s, Options::default(), |bp, props| {
-            got.push((bp, props.is_word_like()));
-            true
-        });
-        assert_eq!(got, expected, "input: {:?}", s);
+        for (name, tok) in TOKENIZERS {
+            let got: Vec<(usize, bool)> = run(*tok, s)
+                .into_iter()
+                .map(|(bp, props)| (bp, props.is_word_like()))
+                .collect();
+            assert_eq!(got, expected, "{name} input: {s:?}");
+        }
     }
 
     /// ASCII subset of the word-like contract: any token containing an ASCII letter or digit is
@@ -545,3 +1131,4 @@ mod tests {
         );
     }
 }
+

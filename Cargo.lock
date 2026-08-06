@@ -65,6 +65,7 @@ dependencies = [
  "parquet",
  "phf",
  "rust-stemmers",
+ "stringzilla",
  "tempfile",
  "tpuf_icu_properties_211",
  "ureq",
@@ -1256,6 +1257,15 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stringzilla"
+version = "5.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29e72ee5c0e53c93aa5334b63af7425dc1a743db5845819a34dc70efa9f482d9"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "subtle"
