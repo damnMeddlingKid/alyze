@@ -60,6 +60,7 @@ impl std::ops::BitOrAssign for TokenProperties {
 
 // All the ascii break rules
 // 
+#[inline]
 pub fn ascii_is_break(
     previous2: WordBreakProperty, 
     previous1: WordBreakProperty, 
@@ -84,50 +85,60 @@ pub fn ascii_is_break(
     // Do not break from extenders.
     // WB13a - (AHLetter | Numeric | ExtendNumLet) × ExtendNumLet
     // WB13b - ExtendNumLet	× (AHLetter | Numeric)
-    use WordBreakProperty::{CR, LF, ALetter, HebrewLetter, WSegSpace, MidLetter, SingleQuote, Numeric, ExtendNumLet, MidNumLet, MidNum, Katakana,
-        Extend, Format, ZWJ
+    use WordBreakProperty::{CR, LF, ALetter, WSegSpace, MidLetter, SingleQuote, Numeric, ExtendNumLet, MidNumLet, MidNum
     };
     
+    // let do_not_break = (previous1 == CR) & (current == LF) // WB3
+    //     | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
+    //     | matches!(previous1, ALetter) & matches!(current, ALetter) // WB5
+    //     | (matches!(previous1, ALetter)
+    //     & (matches!(current, MidLetter | MidNumLet | SingleQuote))
+    //     & matches!(next, ALetter)) // WB6
+    //     | (matches!(previous2, ALetter) 
+    //     & (matches!(previous1, MidLetter | MidNumLet | SingleQuote))
+    //     & matches!(current, ALetter)) // WB7
+    //     | (previous1 == Numeric) & (current == Numeric) // WB8
+    //     | matches!(previous1, ALetter) & (current == Numeric) // WB9
+    //     | (previous1 == Numeric) & matches!(current, ALetter) // WB10
+    //     | ((previous2 == Numeric) 
+    //     & matches!(previous1, MidNum | MidNumLet | SingleQuote)
+    //     & (current == Numeric)) // WB11
+    //     | ((previous1 == Numeric) 
+    //     & matches!(current, MidNum | MidNumLet | SingleQuote)
+    //     & (next == Numeric)) // WB12
+    //     | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
+    //     & (current == ExtendNumLet)) // WB13a
+    //     | (previous1 == ExtendNumLet) & matches!(current, ALetter | Numeric) //WB13b
+    //     ;
+    // !do_not_break
     let do_not_break = (previous1 == CR) & (current == LF) // WB3
         | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
-        | matches!(current, Format | Extend | ZWJ) // WB4
-        | matches!(previous1, ALetter | HebrewLetter) & matches!(current, ALetter | HebrewLetter) // WB5
-        | (matches!(previous1, ALetter | HebrewLetter)
-        & (matches!(current, MidLetter | MidNumLet | SingleQuote))
-        & matches!(next, ALetter | HebrewLetter)) // WB6
-        | (matches!(previous2, ALetter | HebrewLetter) 
-        & (matches!(previous1, MidLetter | MidNumLet | SingleQuote))
-        & matches!(current, ALetter | HebrewLetter)) // WB7
-        | (previous1 == HebrewLetter) & (current == SingleQuote) // WB7a
-        | (previous1 == HebrewLetter) & (current == DoubleQuote) & (next == HebrewLetter) // WB7b
-        | (previous2 == HebrewLetter) & (previous1 == DoubleQuote) & (current == HebrewLetter) // WB7b
-        | (previous1 == Numeric) & (current == Numeric) // WB8
-        | matches!(previous1, ALetter | HebrewLetter) & (current == Numeric) // WB9
-        | (previous1 == Numeric) & matches!(current, ALetter | HebrewLetter) // WB10
-        | ((previous2 == Numeric) 
-        & matches!(previous1, MidNum | MidNumLet | SingleQuote)
-        & (current == Numeric)) // WB11
-        | ((previous1 == Numeric) 
+        // ALetter, Numeric and ExtendNumLet never break against each other, in
+        // any of the 9 orderings. Covers WB5, WB8, WB9, WB10, WB13a and WB13b.
+        | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
+        & matches!(current, ALetter | Numeric | ExtendNumLet))
+        // MidNumLetQ = MidNumLet | SingleQuote
+        | ((previous1 == ALetter)
+        & matches!(current, MidLetter | MidNumLet | SingleQuote)
+        & (next == ALetter)) // WB6
+        | ((previous1 == Numeric)
         & matches!(current, MidNum | MidNumLet | SingleQuote)
         & (next == Numeric)) // WB12
-        | (matches!(previous1, Katakana | ALetter | HebrewLetter | Numeric | ExtendNumLet)
-        & (current == ExtendNumLet)) // WB13a
-        | (previous1 == ExtendNumLet) & matches!(current, Katakana | ALetter  | HebrewLetter | Numeric) //WB13b
+        | ((previous2 == ALetter)
+        & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
+        & (current == ALetter)) // WB7
+        | ((previous2 == Numeric)
+        & matches!(previous1, MidNum | MidNumLet | SingleQuote)
+        & (current == Numeric)) // WB11
         ;
-    !do_not_break 
+    !do_not_break
 }
 
 pub struct WindowTokens {
     pub breaks: u16,
 }
 
-pub fn ascii_window_state(bytes: &[u8], pos: usize) -> State {
-    // match bytes[pos - 1] {
-        
-    // }
-    State::ALetter
-}
-
+#[inline]
 pub fn maybe_process_ascii_window(
     bytes: &[u8], 
     pos: usize, 
@@ -335,10 +346,19 @@ pub fn tokenize_windowed(
             }
         }
     }
-    
-    if !on_breakpoint(pos, std::mem::take(&mut token_props)) {
-        return;
+
+    // Deferred state at EOT - defer failed
+    if state.is_deferred() {
+        let breakpoint = deferred_break_pos.take().unwrap();
+        if !on_breakpoint(breakpoint, std::mem::take(&mut token_props)) {
+            return;
+        }
+        // Deferred chars become the trailing token.
+        token_props |= std::mem::take(&mut deferred_props);
     }
+
+    // WB2: Any ÷ eot — emit final segment
+    _ = on_breakpoint(text.len(), token_props);
 }
 
 /// A tokenizer that implements UAX #29 word boundary rules, using a deterministic finite automaton
@@ -579,6 +599,70 @@ mod tests {
         );
     }
 
+    /// The UAX #29 corpus again, but padded with ASCII so the windowed fast path actually runs.
+    ///
+    /// Every case in `WordBreakTest.txt` is far shorter than one window, and the fast path needs
+    /// `pos >= 2`, `pos + WINDOW < len`, and 16 consecutive ASCII bytes — so the unpadded corpus
+    /// test exercises almost nothing but the scalar path. Wrapping each case in ASCII gives the
+    /// window the runway it needs and slides the body through every alignment within a window.
+    ///
+    /// Padding changes where the boundaries fall, so the file's own annotations no longer apply;
+    /// `tokenize` is the oracle instead, and `test_word_break_against_uax29_tests` pins it at
+    /// 1944/1944 against the file. Breakpoints only — `tokenize_windowed` does not populate
+    /// `TokenProperties` on the window path yet.
+    #[test]
+    fn windowed_matches_dfa_on_padded_corpus() {
+        use super::WINDOW;
+        use crate::uax29::test_helpers::load_break_tests;
+
+        // Prefix lengths, chosen to land the body at every offset mod WINDOW and to straddle one,
+        // two, and three window boundaries.
+        const PADS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 31, 33];
+        // Long enough on its own to satisfy `pos + WINDOW < len` after the body ends.
+        const TAIL: &str = " the quick brown fox jumps over it";
+        const _: () = assert!(TAIL.len() > WINDOW + 2, "tail too short to reach the fast path");
+
+        let mut mismatches = Vec::new();
+        let mut total_mismatches = 0usize;
+        let mut checked = 0usize;
+
+        for case in load_break_tests("testdata/WordBreakTest.txt") {
+            let body = case.codepoints_as_string();
+            for &pad in PADS {
+                let input = format!("{}{body}{TAIL}", "a".repeat(pad));
+
+                let mut want = Vec::new();
+                tokenize(&input, Options::default(), |bp, _props| {
+                    want.push(bp);
+                    true
+                });
+                let mut got = Vec::new();
+                tokenize_windowed(&input, Options::default(), |bp, _props| {
+                    got.push(bp);
+                    true
+                });
+
+                checked += 1;
+                if want != got {
+                    total_mismatches += 1;
+                    if mismatches.len() < 15 {
+                        mismatches.push(format!(
+                            "  pad={pad} {input:?}\n      want {want:?}\n       got {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "{}\n\n{total_mismatches} / {checked} padded inputs disagree with the DFA \
+             (showing first {})",
+            mismatches.join("\n"),
+            mismatches.len()
+        );
+    }
+
     /// A few cases from each category of `test_windowed_break_against_uax29_tests` failure, so a
     /// run points at *which kind* of input is wrong instead of just a count. Every case here is
     /// drawn from `WordBreakTest.txt` except the window-alignment group at the end, which the
@@ -737,8 +821,8 @@ mod tests {
             });
             assert_eq!(actual, expected, "input: {:?}", s);
         }
-
-        assert_breaks(",\u{0308}A");
+        
+        assert_breaks("can'");
     }
     
     #[test]

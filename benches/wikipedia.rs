@@ -9,7 +9,7 @@ use alyze::analyze::{
     StopwordRemoval, TokenizerOptions,
 };
 use alyze::uax29;
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parquet::{
     file::reader::{FileReader, SerializedFileReader},
     record::{Row, RowAccessor, reader::RowIter},
@@ -18,6 +18,48 @@ use parquet::{
 
 criterion_group!(benches, wikipedia_benchmark, analysis_benchmark);
 criterion_main!(benches);
+
+/// Stamps out the word-break benchmarks for one tokenizer.
+///
+/// A macro rather than a `&[(&str, fn(..))]` table on purpose: the callback is invoked once per
+/// token, so routing it through `&mut dyn FnMut` to make the tokenizers share a signature would
+/// add a virtual call to the hottest loop in the measurement. Taking the tokenizer as a path
+/// keeps every call statically dispatched and inlinable, exactly as a real caller would get.
+macro_rules! word_break_benches {
+    ($group:expr, $texts:expr, $name:expr, $tokenize:path $(,)?) => {{
+        $group.bench_function(BenchmarkId::new("word break", $name), |b| {
+            b.iter(|| {
+                let mut count = 0;
+                for text in $texts {
+                    $tokenize(text, uax29::word::Options::default(), |_, _| {
+                        count += 1;
+                        true
+                    });
+                }
+                std::hint::black_box(&count);
+            })
+        });
+
+        // When `props` is unused, LLVM will optimize it away (which is amazing!), but we also want
+        // to benchmark the cost of computing and using this word-like property.
+        $group.bench_function(BenchmarkId::new("word break + word_like", $name), |b| {
+            b.iter(|| {
+                let mut count = 0;
+                let mut word_like = 0;
+                for text in $texts {
+                    $tokenize(text, uax29::word::Options::default(), |_, props| {
+                        count += 1;
+                        if props.is_word_like() {
+                            word_like += 1;
+                        }
+                        true
+                    });
+                }
+                std::hint::black_box((&count, &word_like));
+            })
+        });
+    }};
+}
 
 pub fn wikipedia_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("wikipedia");
@@ -28,37 +70,11 @@ pub fn wikipedia_benchmark(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(n_bytes));
     group.sample_size(16);
 
-    group.bench_function("word break", |b| {
-        b.iter(|| {
-            let mut count = 0;
-            for text in &texts {
-                uax29::word::tokenize(text, uax29::word::Options::default(), |_, _| {
-                    count += 1;
-                    true
-                });
-            }
-            std::hint::black_box(&count);
-        })
-    });
-
-    // When `props` is unused, LLVM will optimize it away (which is amazing!), but we also want
-    // to benchmark the cost of computing and using this word-like property.
-    group.bench_function("word break + word_like", |b| {
-        b.iter(|| {
-            let mut count = 0;
-            let mut word_like = 0;
-            for text in &texts {
-                uax29::word::tokenize(text, uax29::word::Options::default(), |_, props| {
-                    count += 1;
-                    if props.is_word_like() {
-                        word_like += 1;
-                    }
-                    true
-                });
-            }
-            std::hint::black_box((&count, &word_like));
-        })
-    });
+    word_break_benches!(group, &texts, "dfa", uax29::word::tokenize);
+    // NOTE: `tokenize_windowed` does not populate `TokenProperties` on the window fast path yet,
+    // so its "+ word_like" row is doing strictly less work than the dfa row and the two are not
+    // comparable until that is wired up. The plain "word break" row is a fair comparison.
+    word_break_benches!(group, &texts, "windowed", uax29::word::tokenize_windowed);
 
     group.bench_function("sentence break", |b| {
         b.iter(|| {
