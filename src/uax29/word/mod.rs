@@ -13,12 +13,12 @@ use transitions::{State, TABLE, Transition};
 #[non_exhaustive]
 pub struct Options {}
 
+const WINDOW: usize = 16;
+
 /// For a given span, extracts info from the DFA state to provide useful information upstream, e.g.
 /// whether the span was "word-like", ascii, etc
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq)]
 pub struct TokenProperties(u8);
-
-const WINDOW: usize = 16;
 
 impl TokenProperties {
     const WORD_LIKE_MASK: u8 = 0b0000_0001;
@@ -136,6 +136,8 @@ pub fn ascii_is_break(
 
 pub struct WindowTokens {
     pub breaks: u16,
+    pub word_like: u16,
+    pub ascii_upper: u16
 }
 
 #[inline]
@@ -145,8 +147,14 @@ pub fn maybe_process_ascii_window(
     previous1: WordBreakProperty, 
     previous2: WordBreakProperty
 ) -> Option<WindowTokens> {
+    use WordBreakProperty::{CR, LF, ALetter, WSegSpace, MidLetter, SingleQuote, Numeric, ExtendNumLet, MidNumLet, MidNum
+    };
+    
     let mut breaks: u16 = 0;
+    let mut word_like: u16 = 0;
+    let mut ascii_upper: u16 = 0;
     let mut classes = [WordBreakProperty::Other; WINDOW];
+    let mut info = [0u8; WINDOW];
 
     // TODO: should we fuse the two loops ?
     // TODO: Compute this in one pass, no mut
@@ -155,6 +163,7 @@ pub fn maybe_process_ascii_window(
         if b >= 0x80 {
             return None
         }
+        info[i] = ASCII_BYTE_INFO[bytes[pos + i] as usize];
         classes[i] = ASCII_WORD_BREAK_PROP[bytes[pos + i] as usize];
     }
     
@@ -163,11 +172,34 @@ pub fn maybe_process_ascii_window(
         let previous1 = if i > 0 {classes[i - 1]} else {previous1};
         let current = classes[i];
         let next = if i + 1 < WINDOW {classes[i+1]} else {WordBreakProperty::Other};
+        let do_not_break = (previous1 == CR) & (current == LF) // WB3
+            | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
+            // ALetter, Numeric and ExtendNumLet never break against each other, in
+            // any of the 9 orderings. Covers WB5, WB8, WB9, WB10, WB13a and WB13b.
+            | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
+            & matches!(current, ALetter | Numeric | ExtendNumLet))
+            // MidNumLetQ = MidNumLet | SingleQuote
+            | ((previous1 == ALetter)
+            & matches!(current, MidLetter | MidNumLet | SingleQuote)
+            & (next == ALetter)) // WB6
+            | ((previous1 == Numeric)
+            & matches!(current, MidNum | MidNumLet | SingleQuote)
+            & (next == Numeric)) // WB12
+            | ((previous2 == ALetter)
+            & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
+            & (current == ALetter)) // WB7
+            | ((previous2 == Numeric)
+            & matches!(previous1, MidNum | MidNumLet | SingleQuote)
+            & (current == Numeric)) // WB11
+            ;
+        
         let does_break = ascii_is_break(previous2, previous1, current, next);
         breaks |= (does_break as u16) << i;
+        ascii_upper |= (info[i] & 4 != 0) as u16;
+        word_like |= (info[i] & 1 != 0) as u16;
     }
 
-    Some(WindowTokens{breaks:breaks})
+    Some(WindowTokens{breaks:breaks, word_like:word_like, ascii_upper: ascii_upper})
 }
 
 pub fn tokenize_windowed(
@@ -189,7 +221,9 @@ pub fn tokenize_windowed(
     let mut deferred_props = TokenProperties::default();
     
     while pos < text.len() {
-        // ACII fast path
+        // ACII Windowed fast path
+        // We only accept all ascii windows
+        // We dont handoff state from the scalar parsing to the window
         if pos >= 2 
         && pos + WINDOW < bytes.len()
         && deferred_break_pos.is_none()
@@ -199,21 +233,42 @@ pub fn tokenize_windowed(
         {
             let previous1 = ASCII_WORD_BREAK_PROP[bytes[pos-1] as usize];
             let previous2 = ASCII_WORD_BREAK_PROP[bytes[pos-2] as usize];
-            
-            if let Some(mut res) = maybe_process_ascii_window(bytes, pos, previous1, previous2) {                     
+
+            if let Some(mut res) = maybe_process_ascii_window(bytes, pos, previous1, previous2) {
+                let remaining_tokens = res.breaks.leading_zeros();
+
                 while res.breaks != 0 {
                     let next_break = res.breaks.trailing_zeros() as usize;
-                    // TODO: Figure out token props
+                    let prop_mask = (1 << next_break) - 1;
+
+                    if res.word_like & prop_mask != 0 {
+                        token_props.0 |= TokenProperties::WORD_LIKE_MASK;
+                    }
+
+                    if res.ascii_upper & prop_mask != 0 {
+                        token_props.0 |= TokenProperties::HAS_ASCII_UPPER_MASK;
+                    }
+
                     if !on_breakpoint(pos + next_break, std::mem::take(&mut token_props)) {
                         return;
                     }
+
                     res.breaks &= res.breaks - 1;
+                    res.word_like &= !prop_mask;
+                    res.ascii_upper &= !prop_mask;
                 }
-                
                 // handoff to the next window, we will need to handoff tokenprops
                 // Process the next window
-                // TODO: Do handoff here
-                // Update state here
+
+                // handoof token props to continue into the next window
+                // we already zero'd out other tokens so theres no mask required
+                if remaining_tokens != 0 {
+                    let word_like = ((res.word_like) != 0) as u8;
+                    let ascii_upper = (((res.ascii_upper) != 0) as u8) << 2;
+                    token_props.0 = (word_like & TokenProperties::WORD_LIKE_MASK) 
+                        | (ascii_upper & TokenProperties::HAS_ASCII_UPPER_MASK);
+                }
+
                 pos += WINDOW;
                 state = match bytes[pos-1] {
                     b'0'..=b'9' => State::Numeric,
@@ -788,6 +843,7 @@ mod tests {
 
 
 
+
     #[test]
     fn test_word_break_against_uax29_tests() {
         let (passed, failed) =
@@ -1008,6 +1064,133 @@ mod tests {
         assert_word_like("   ", vec![(0, false), (3, false)]);
         // ASCII punctuation: each '!' breaks separately, none word-like.
         assert_word_like("!!!", vec![(0, false), (1, false), (2, false), (3, false)]);
+    }
+
+    /// One reduced case from `windowed_token_props_on_padded_ascii`, hardcoded.
+    ///
+    /// The shortest input that reproduces the property bug: 25 bytes, one window plus a tail.
+    /// Breakpoints are all correct — only the `WORD_LIKE` bit on the token `"brown"` is wrong,
+    /// and only that one, while the tokens before and after it are fine. `"brown"` is the token
+    /// that spans the handoff out of the first window, so this pins the carry at
+    /// `tokenize_windowed`'s `if last_break != 0` block rather than the per-token mask slicing.
+    ///
+    /// Expected values are written out rather than taken from `tokenize`, so a debugger session
+    /// on this test has a fixed target that cannot move if the oracle changes.
+    #[test]
+    fn windowed_token_props_single_case() {
+        use super::TokenProperties;
+
+        const INPUT: &str = "hello the quick brown fox";
+        // (breakpoint, raw TokenProperties bits, the token that just closed)
+        const EXPECTED: &[(usize, u8, &str)] = &[
+            (0, 0b000, ""),
+            (5, 0b001, "hello"),
+            (6, 0b000, " "),
+            (9, 0b001, "the"),
+            (10, 0b000, " "),
+            (15, 0b001, "quick"),
+            (16, 0b000, " "),
+            (21, 0b001, "brown"), // <-- windowed reports 0b000 here
+            (22, 0b000, " "),
+            (25, 0b001, "fox"),
+        ];
+
+        let mut got: Vec<(usize, u8)> = Vec::new();
+        tokenize_windowed(INPUT, Options::default(), |bp, props: TokenProperties| {
+            got.push((bp, props.0));
+            true
+        });
+
+        let want: Vec<(usize, u8)> = EXPECTED.iter().map(|&(bp, p, _)| (bp, p)).collect();
+        if got != want {
+            let mut report = String::new();
+            for (i, &(bp, bits, tok)) in EXPECTED.iter().enumerate() {
+                let g = got.get(i);
+                let mark = if g == Some(&(bp, bits)) { "   " } else { "-> " };
+                report.push_str(&format!(
+                    "{mark}#{i} {tok:?}\n      want bp={bp} props={bits:#05b}\n       got {}\n",
+                    match g {
+                        Some((b, p)) => format!("bp={b} props={p:#05b}"),
+                        None => "<no emit>".to_string(),
+                    }
+                ));
+            }
+            panic!("{INPUT:?}\n{report}");
+        }
+    }
+
+    /// The bodies from `tokenizer_word_like_ascii_sanity`, padded so they run through the
+    /// windowed fast path rather than the scalar one.
+    ///
+    /// Unpadded those cases are all shorter than one window, so they never reach
+    /// `maybe_process_ascii_window` and say nothing about the property bookkeeping there — which
+    /// is the interesting part, since the window accumulates `word_like` / `ascii_upper` as lane
+    /// masks and has to slice them per token and carry the tail across the window handoff.
+    ///
+    /// Expectations come from `tokenize` rather than being written out, because padding changes
+    /// both the offsets and which token each body merges into.
+    #[test]
+    fn windowed_token_props_on_padded_ascii() {
+        // Bodies from `tokenizer_word_like_ascii_sanity`, plus uppercase and boundary-straddling
+        // cases so `has_ascii_upper` and the cross-window carry are exercised too.
+        const BODIES: &[&str] = &[
+            "hello", "123", "abc123", "won't", "___", "   ", "!!!", "Hello", "aB", "HELLO",
+            "a_b_c", "3.14", "e.g.", "x", "",
+        ];
+        const PADS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 31, 33];
+        const TAIL: &str = " the quick brown fox jumps over it";
+
+        use super::TokenProperties;
+
+        // The whole bitfield, not the three accessors — a bit that neither side exposes yet still
+        // has to match, and a raw value diffs more legibly than three separate bools.
+        fn run(
+            tok: impl Fn(&str, Options, &mut dyn FnMut(usize, TokenProperties) -> bool),
+            s: &str,
+        ) -> Vec<(usize, u8)> {
+            let mut out = Vec::new();
+            tok(s, Options::default(), &mut |bp, props| {
+                out.push((bp, props.0));
+                true
+            });
+            out
+        }
+
+        let mut failures = Vec::new();
+        let mut checked = 0usize;
+        for body in BODIES {
+            for &pad in PADS {
+                let input = format!("{}{body}{TAIL}", "a".repeat(pad));
+                let want = run(|s, o, cb| tokenize(s, o, cb), &input);
+                let got = run(|s, o, cb| tokenize_windowed(s, o, cb), &input);
+                checked += 1;
+                if want != got {
+                    let first = want
+                        .iter()
+                        .zip(&got)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(want.len().min(got.len()));
+                    let fmt = |e: Option<&(usize, u8)>| match e {
+                        Some((bp, bits)) => format!("bp={bp} props={bits:#07b}"),
+                        None => "<no emit>".to_string(),
+                    };
+                    failures.push(format!(
+                        "  body={body:?} pad={pad} {input:?}\n      \
+                         first differing emit #{first}\n      \
+                         want {}\n       got {}",
+                        fmt(want.get(first)),
+                        fmt(got.get(first)),
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{}\n\n{} / {checked} padded inputs disagree on token properties",
+            failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n"),
+            failures.len(),
+        );
     }
 
     /// Strict cases that need Script / Ideographic / OtherNumber / ExtPict lookups beyond the
