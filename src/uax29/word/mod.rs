@@ -147,9 +147,6 @@ pub fn maybe_process_ascii_window(
     previous1: WordBreakProperty, 
     previous2: WordBreakProperty
 ) -> Option<WindowTokens> {
-    use WordBreakProperty::{CR, LF, ALetter, WSegSpace, MidLetter, SingleQuote, Numeric, ExtendNumLet, MidNumLet, MidNum
-    };
-    
     let mut word_like: u32 = 0;
     let mut ascii_upper: u32 = 0;
     let mut is_letter: u32 = 0;
@@ -222,7 +219,6 @@ pub fn maybe_process_ascii_window(
     let do_not_break = wb6wb7 | wb11wb12 | wbex1 | wbcrlf | wbwseg;
     let breaks = !(do_not_break >> 2) as u16;
 
-
     Some(WindowTokens{breaks:breaks, word_like: (word_like >> 2) as u16, ascii_upper: (ascii_upper >> 2) as u16})
 }
 
@@ -257,6 +253,8 @@ pub fn tokenize_windowed(
         {
             let previous1 = ASCII_WORD_BREAK_PROP[bytes[pos-1] as usize];
             let previous2 = ASCII_WORD_BREAK_PROP[bytes[pos-2] as usize];
+            let mask = 0xFFFF;
+            let mut prev_idx = 0;
 
             if let Some(mut res) = maybe_process_ascii_window(bytes, pos, previous1, previous2) {
                 let remaining_tokens = res.breaks.leading_zeros();
@@ -265,14 +263,9 @@ pub fn tokenize_windowed(
                     let next_break = res.breaks.trailing_zeros() as usize;
                     let prop_mask = (1 << next_break) - 1;
 
-                    if res.word_like & prop_mask != 0 {
-                        token_props.0 |= TokenProperties::WORD_LIKE_MASK;
-                    }
-
-                    if res.ascii_upper & prop_mask != 0 {
-                        token_props.0 |= TokenProperties::HAS_ASCII_UPPER_MASK;
-                    }
-
+                    token_props.0 |= ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
+                    token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
+                    
                     if !on_breakpoint(pos + next_break, std::mem::take(&mut token_props)) {
                         return;
                     }
@@ -281,6 +274,8 @@ pub fn tokenize_windowed(
                     res.word_like &= !prop_mask;
                     res.ascii_upper &= !prop_mask;
                 }
+
+                
                 // handoff to the next window, we will need to handoff tokenprops
                 // Process the next window
 
