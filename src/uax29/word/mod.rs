@@ -158,6 +158,12 @@ pub fn maybe_process_ascii_window(
 
     // TODO: should we fuse the two loops ?
     // TODO: Compute this in one pass, no mut
+
+    let mut is_letter: u16 = 0;
+    let mut is_mid_num_let: u16 = 0;
+    let mut previous_1_is_letter: u16 = (previous1 == ALetter) as u16;
+    let mut previous_2_is_letter: u16 = (previous_1_is_letter << 1) | (previous2 == ALetter) as u16;
+
     for i in 0..WINDOW {
         let b = bytes[pos + i];
         if b >= 0x80 {
@@ -165,13 +171,59 @@ pub fn maybe_process_ascii_window(
         }
         info[i] = ASCII_BYTE_INFO[bytes[pos + i] as usize];
         classes[i] = ASCII_WORD_BREAK_PROP[bytes[pos + i] as usize];
+        is_letter |= ((classes[i] == ALetter) as u16) << i;
+        is_mid_num_let |= (matches!(classes[i], MidLetter | MidNumLet | SingleQuote) as u16) << i;
     }
+
+    
+    //((previous1 == ALetter) & matches!(current, MidLetter | MidNumLet | SingleQuote) & (next == ALetter)) 
+    // (is_letter << 1) & is_mid_num_let & (is_letter >> 1) 
+    // ((is_letter << 1)| previous_1_is_letter) & is_mid_num_let & (is_letter >> 1) 
+    // (A + P1) & B & C 
+    // (ABC + P1BC)
+    // 
+    // (A + (P1+P2)) & (B + P1) & C
+    // ABC + P1BC + AP1C  + BP2C + P1C
+    // 
+    // (A + (P1+P2)) & (B + P1) & C + (A + P1) & B & C
+    // (ABC + P1BC) + ABC + P1BC + AP1C  + BP2C + P1C
+
+    // ABC + P1BC + A'B'C' + P1B'C' + A'P1C' + P1C' + B'P2C' 
+    // ABC + P1BC + A'B'C' + P1B'C' + (P1 + P2B')C'
+
+
+    //((previous2 == ALetter) & matches!(previous1, MidLetter | MidNumLet | SingleQuote) & (current == ALetter))
+    // (is_letter << 2) & (is_mid_num_let << 1) & is_letter
+    // ((is_letter << 2) | previous_2_is_letter) & (is_mid_num_let << 1 | previous_1_is_letter) & is_letter
+    
     
     for i in 0..WINDOW as usize {
         let previous2 = if i > 1 {classes[i - 2]} else if i == 0 {previous2} else {previous1};
         let previous1 = if i > 0 {classes[i - 1]} else {previous1};
         let current = classes[i];
+        // TODO: we need a real next
         let next = if i + 1 < WINDOW {classes[i+1]} else {WordBreakProperty::Other};
+        // let do_not_break = (previous1 == CR) & (current == LF) // WB3
+        //     | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
+        //     // ALetter, Numeric and ExtendNumLet never break against each other, in
+        //     // any of the 9 orderings. Covers WB5, WB8, WB9, WB10, WB13a and WB13b.
+        //     | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
+        //     & matches!(current, ALetter | Numeric | ExtendNumLet))
+        //     // MidNumLetQ = MidNumLet | SingleQuote
+        //     | ((previous1 == ALetter)
+        //     & matches!(current, MidLetter | MidNumLet | SingleQuote)
+        //     & (next == ALetter)) // WB6
+        //     | ((previous1 == Numeric)
+        //     & matches!(current, MidNum | MidNumLet | SingleQuote)
+        //     & (next == Numeric)) // WB12
+        //     | ((previous2 == ALetter)
+        //     & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
+        //     & (current == ALetter)) // WB7
+        //     | ((previous2 == Numeric)
+        //     & matches!(previous1, MidNum | MidNumLet | SingleQuote)
+        //     & (current == Numeric)) // WB11
+        //     ;
+
         let do_not_break = (previous1 == CR) & (current == LF) // WB3
             | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
             // ALetter, Numeric and ExtendNumLet never break against each other, in
@@ -193,10 +245,10 @@ pub fn maybe_process_ascii_window(
             & (current == Numeric)) // WB11
             ;
         
-        let does_break = ascii_is_break(previous2, previous1, current, next);
+        let does_break = !do_not_break; //ascii_is_break(previous2, previous1, current, next);
         breaks |= (does_break as u16) << i;
-        ascii_upper |= (info[i] & 4 != 0) as u16;
-        word_like |= (info[i] & 1 != 0) as u16;
+        ascii_upper |= ((info[i] & TokenProperties::HAS_ASCII_UPPER_MASK != 0) as u16) << i;
+        word_like |= ((info[i] & TokenProperties::WORD_LIKE_MASK != 0) as u16) << i;
     }
 
     Some(WindowTokens{breaks:breaks, word_like:word_like, ascii_upper: ascii_upper})
