@@ -143,9 +143,7 @@ pub struct WindowTokens {
 #[inline]
 pub fn maybe_process_ascii_window(
     bytes: &[u8], 
-    pos: usize, 
-    previous1: WordBreakProperty, 
-    previous2: WordBreakProperty
+    pos: usize
 ) -> Option<WindowTokens> {
     let mut word_like: u32 = 0;
     let mut ascii_upper: u32 = 0;
@@ -251,28 +249,25 @@ pub fn tokenize_windowed(
         && bytes[pos-1] < 0x80
         && bytes[pos-2] < 0x80
         {
-            let previous1 = ASCII_WORD_BREAK_PROP[bytes[pos-1] as usize];
-            let previous2 = ASCII_WORD_BREAK_PROP[bytes[pos-2] as usize];
-            let mask = 0xFFFF;
-            let mut prev_idx = 0;
-
-            if let Some(mut res) = maybe_process_ascii_window(bytes, pos, previous1, previous2) {
+            if let Some(res) = maybe_process_ascii_window(bytes, pos) {
                 let remaining_tokens = res.breaks.leading_zeros();
-
-                while res.breaks != 0 {
-                    let next_break = res.breaks.trailing_zeros() as usize;
-                    let prop_mask = (1 << next_break) - 1;
+                let mut breaks = res.breaks;
+                
+                let mut start = 0;
+                while breaks != 0 {
+                    let next_break = breaks.trailing_zeros();
+                    
+                    let prop_mask: u16 = (1u16 << next_break) - (1u16 << start);
 
                     token_props.0 |= ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
                     token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
                     
-                    if !on_breakpoint(pos + next_break, std::mem::take(&mut token_props)) {
+                    if !on_breakpoint(pos + next_break as usize, std::mem::take(&mut token_props)) {
                         return;
                     }
 
-                    res.breaks &= res.breaks - 1;
-                    res.word_like &= !prop_mask;
-                    res.ascii_upper &= !prop_mask;
+                    start = next_break;
+                    breaks &= breaks - 1;
                 }
 
                 
