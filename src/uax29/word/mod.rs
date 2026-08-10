@@ -150,108 +150,80 @@ pub fn maybe_process_ascii_window(
     use WordBreakProperty::{CR, LF, ALetter, WSegSpace, MidLetter, SingleQuote, Numeric, ExtendNumLet, MidNumLet, MidNum
     };
     
-    let mut breaks: u16 = 0;
-    let mut word_like: u16 = 0;
-    let mut ascii_upper: u16 = 0;
-    let mut classes = [WordBreakProperty::Other; WINDOW];
-    let mut info = [0u8; WINDOW];
+    let mut word_like: u32 = 0;
+    let mut ascii_upper: u32 = 0;
+    let mut is_letter: u32 = 0;
+    let mut is_numeric: u32 = 0;
+    let mut is_mid_let: u32 = 0;
+    let mut is_mid_num: u32 = 0;
+    let mut is_extend: u32 = 0;
+    let mut is_cr: u32 = 0;
+    let mut is_lf: u32 = 0;
+    let mut is_wseg: u32 = 0;
 
-    // TODO: should we fuse the two loops ?
-    // TODO: Compute this in one pass, no mut
-
-    let mut is_letter: u16 = 0;
-    let mut is_mid_num_let: u16 = 0;
-    let mut previous_1_is_letter: u16 = (previous1 == ALetter) as u16;
-    let mut previous_2_is_letter: u16 = (previous_1_is_letter << 1) | (previous2 == ALetter) as u16;
-
-    for i in 0..WINDOW {
-        let b = bytes[pos + i];
+    for i in 0..(WINDOW + 2 + 1) {
+        let b = bytes[pos -2 + i];
         if b >= 0x80 {
             return None
         }
-        info[i] = ASCII_BYTE_INFO[bytes[pos + i] as usize];
-        classes[i] = ASCII_WORD_BREAK_PROP[bytes[pos + i] as usize];
-        is_letter |= ((classes[i] == ALetter) as u16) << i;
-        is_mid_num_let |= (matches!(classes[i], MidLetter | MidNumLet | SingleQuote) as u16) << i;
     }
 
-    
-    //((previous1 == ALetter) & matches!(current, MidLetter | MidNumLet | SingleQuote) & (next == ALetter)) 
-    // (is_letter << 1) & is_mid_num_let & (is_letter >> 1) 
-    // ((is_letter << 1)| previous_1_is_letter) & is_mid_num_let & (is_letter >> 1) 
-    // (A + P1) & B & C 
-    // (ABC + P1BC)
-    // 
-    // (A + (P1+P2)) & (B + P1) & C
-    // ABC + P1BC + AP1C  + BP2C + P1C
-    // 
-    // (A + (P1+P2)) & (B + P1) & C + (A + P1) & B & C
-    // (ABC + P1BC) + ABC + P1BC + AP1C  + BP2C + P1C
+    let mask = 1;
 
-    // ABC + P1BC + A'B'C' + P1B'C' + A'P1C' + P1C' + B'P2C' 
-    // ABC + P1BC + A'B'C' + P1B'C' + (P1 + P2B')C'
-
-
-    //((previous2 == ALetter) & matches!(previous1, MidLetter | MidNumLet | SingleQuote) & (current == ALetter))
-    // (is_letter << 2) & (is_mid_num_let << 1) & is_letter
-    // ((is_letter << 2) | previous_2_is_letter) & (is_mid_num_let << 1 | previous_1_is_letter) & is_letter
-    
-    
-    for i in 0..WINDOW as usize {
-        let previous2 = if i > 1 {classes[i - 2]} else if i == 0 {previous2} else {previous1};
-        let previous1 = if i > 0 {classes[i - 1]} else {previous1};
-        let current = classes[i];
-        // TODO: we need a real next
-        let next = if i + 1 < WINDOW {classes[i+1]} else {WordBreakProperty::Other};
-        // let do_not_break = (previous1 == CR) & (current == LF) // WB3
-        //     | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
-        //     // ALetter, Numeric and ExtendNumLet never break against each other, in
-        //     // any of the 9 orderings. Covers WB5, WB8, WB9, WB10, WB13a and WB13b.
-        //     | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
-        //     & matches!(current, ALetter | Numeric | ExtendNumLet))
-        //     // MidNumLetQ = MidNumLet | SingleQuote
-        //     | ((previous1 == ALetter)
-        //     & matches!(current, MidLetter | MidNumLet | SingleQuote)
-        //     & (next == ALetter)) // WB6
-        //     | ((previous1 == Numeric)
-        //     & matches!(current, MidNum | MidNumLet | SingleQuote)
-        //     & (next == Numeric)) // WB12
-        //     | ((previous2 == ALetter)
-        //     & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
-        //     & (current == ALetter)) // WB7
-        //     | ((previous2 == Numeric)
-        //     & matches!(previous1, MidNum | MidNumLet | SingleQuote)
-        //     & (current == Numeric)) // WB11
-        //     ;
-
-        let do_not_break = (previous1 == CR) & (current == LF) // WB3
-            | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
-            // ALetter, Numeric and ExtendNumLet never break against each other, in
-            // any of the 9 orderings. Covers WB5, WB8, WB9, WB10, WB13a and WB13b.
-            | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
-            & matches!(current, ALetter | Numeric | ExtendNumLet))
-            // MidNumLetQ = MidNumLet | SingleQuote
-            | ((previous1 == ALetter)
-            & matches!(current, MidLetter | MidNumLet | SingleQuote)
-            & (next == ALetter)) // WB6
-            | ((previous1 == Numeric)
-            & matches!(current, MidNum | MidNumLet | SingleQuote)
-            & (next == Numeric)) // WB12
-            | ((previous2 == ALetter)
-            & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
-            & (current == ALetter)) // WB7
-            | ((previous2 == Numeric)
-            & matches!(previous1, MidNum | MidNumLet | SingleQuote)
-            & (current == Numeric)) // WB11
-            ;
-        
-        let does_break = !do_not_break; //ascii_is_break(previous2, previous1, current, next);
-        breaks |= (does_break as u16) << i;
-        ascii_upper |= ((info[i] & TokenProperties::HAS_ASCII_UPPER_MASK != 0) as u16) << i;
-        word_like |= ((info[i] & TokenProperties::WORD_LIKE_MASK != 0) as u16) << i;
+    for i in 0..(WINDOW + 2 + 1) {
+        is_mid_let |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask)) << i;
+        is_mid_num |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<1)) >> 1 << i;
+        is_extend |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<2)) >> 2 << i;
+        is_letter |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<3)) >> 3 << i;
+        is_numeric |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<4)) >> 4 << i;
+        is_cr |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<5)) >> 5 << i;
+        is_lf |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<6)) >> 6 << i;
+        is_wseg |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<7)) >> 7 << i;
+        word_like |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<8)) >> 8 << i;
+        ascii_upper |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<9)) >> 9 << i;
     }
 
-    Some(WindowTokens{breaks:breaks, word_like:word_like, ascii_upper: ascii_upper})
+    /*
+     | ((previous1 == ALetter)
+     & matches!(current, MidLetter | MidNumLet | SingleQuote)
+     & (next == ALetter)) // WB6
+     | ((previous2 == ALetter)
+     & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
+     & (current == ALetter)) // WB7
+     */
+
+    let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1); 
+    let wb6wb7 = wb6 | (wb6 << 1);
+
+     /*
+     | ((previous1 == Numeric)
+     & matches!(current, MidNum | MidNumLet | SingleQuote)
+     & (next == Numeric)) // WB12
+     | ((previous2 == Numeric)
+     & matches!(previous1, MidNum | MidNumLet | SingleQuote)
+     & (current == Numeric)) // WB11
+      */
+    let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
+    let wb11wb12 = wb12 | (wb12 << 1);
+
+    /*
+    | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
+    & matches!(current, ALetter | Numeric | ExtendNumLet))
+     */
+    let wbex1 = is_extend & (is_extend << 1);
+
+    /*
+    (previous1 == CR) & (current == LF) // WB3
+    | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
+     */
+    let wbcrlf = is_lf & (is_cr << 1);
+    let wbwseg = is_wseg & (is_wseg << 1);
+
+    let do_not_break = wb6wb7 | wb11wb12 | wbex1 | wbcrlf | wbwseg;
+    let breaks = !(do_not_break >> 2) as u16;
+
+
+    Some(WindowTokens{breaks:breaks, word_like: (word_like >> 2) as u16, ascii_upper: (ascii_upper >> 2) as u16})
 }
 
 pub fn tokenize_windowed(
@@ -277,7 +249,7 @@ pub fn tokenize_windowed(
         // We only accept all ascii windows
         // We dont handoff state from the scalar parsing to the window
         if pos >= 2 
-        && pos + WINDOW < bytes.len()
+        && pos + WINDOW + 2 + 1 < bytes.len()
         && deferred_break_pos.is_none()
         && last_was_zwj == false 
         && bytes[pos-1] < 0x80
@@ -675,6 +647,48 @@ const ASCII_BYTE_INFO: [u8; 128] = {
             b'_' => ASCII_WORD_CONTINUE,
             _ => 0,
         };
+        if i == 127 {
+            break;
+        }
+        i += 1;
+    }
+    t
+};
+
+/*
+is_mid_let |= (matches!(classes[i], MidLetter | MidNumLet | SingleQuote) as u32) << i;
+is_mid_num |= (matches!(classes[i], MidNum | MidNumLet | SingleQuote) as u32) << i;
+is_extend |= (matches!(classes[i], ALetter | Numeric | ExtendNumLet) as u32) << i;
+*/
+const ASCII_CUSTOM: [u16; 128] = {
+    let mut t = [0u16; 128];
+    let mut i = 0u16;
+    loop {
+        t[i as usize] = {
+            /*
+            is_letter |= ((classes[i] == ALetter) as u32) << i;
+            is_numeric |= ((classes[i] == Numeric) as u32) << i;
+            is_cr |= ((classes[i] == CR) as u32) << i;
+            is_lf |= ((classes[i] == LF) as u32) << i;
+            is_wseg |= ((classes[i] == WSegSpace) as u32) << i;
+            
+            word_like |= ((info[i] & TokenProperties::WORD_LIKE_MASK) as u32) << i;
+            ascii_upper |= ((info[i] & TokenProperties::HAS_ASCII_UPPER_MASK) as u32 >> 2) << i;
+             */
+            let mid_let = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::MidLetter | WordBreakProperty::MidNumLet | WordBreakProperty::SingleQuote) as u16;
+            let mid_num = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::MidNum | WordBreakProperty::MidNumLet | WordBreakProperty::SingleQuote) as u16;
+            let extend = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::ALetter | WordBreakProperty::Numeric | WordBreakProperty::ExtendNumLet) as u16;
+            let letter = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::ALetter) as u16;
+            let numeric = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::Numeric) as u16;
+            let cr = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::CR) as u16;
+            let lf = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::LF) as u16;
+            let wseg = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::WSegSpace) as u16;
+            let word_like = (ASCII_BYTE_INFO[i as usize] & TokenProperties::WORD_LIKE_MASK) as u16;
+            let ascii_upper = ((ASCII_BYTE_INFO[i as usize] & TokenProperties::HAS_ASCII_UPPER_MASK) >> 2) as u16;
+            mid_let | (mid_num << 1) | (extend << 2) | (letter << 3) | (numeric << 4) | (cr << 5) | (lf << 6) | (wseg << 7)
+            | (word_like << 8) | (ascii_upper << 9)
+        };
+        
         if i == 127 {
             break;
         }
