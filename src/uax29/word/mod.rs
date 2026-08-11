@@ -250,7 +250,6 @@ pub fn tokenize_windowed(
         && bytes[pos-2] < 0x80
         {
             if let Some(res) = maybe_process_ascii_window(bytes, pos) {
-                let remaining_tokens = res.breaks.leading_zeros();
                 let mut breaks = res.breaks;
                 
                 let mut start = 0;
@@ -276,12 +275,9 @@ pub fn tokenize_windowed(
 
                 // handoof token props to continue into the next window
                 // we already zero'd out other tokens so theres no mask required               
-                if remaining_tokens != 0 {
-                    let word_like = ((res.word_like) != 0) as u8;
-                    let ascii_upper = (((res.ascii_upper) != 0) as u8) << 2;
-                    token_props.0 = (word_like & TokenProperties::WORD_LIKE_MASK) 
-                        | (ascii_upper & TokenProperties::HAS_ASCII_UPPER_MASK);
-                }
+                let prop_mask: u16 =((1u32 << 16) - (1u32 << start)) as u16;
+                token_props.0 = ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
+                token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
 
                 pos += WINDOW;
                 state = match bytes[pos-1] {
