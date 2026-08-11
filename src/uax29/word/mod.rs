@@ -243,51 +243,49 @@ pub fn tokenize_windowed(
         // We only accept all ascii windows
         // We dont handoff state from the scalar parsing to the window
         if pos >= 2 
-        && pos + WINDOW + 2 + 1 < bytes.len()
+        && pos + WINDOW + 3 < bytes.len()
         && deferred_break_pos.is_none()
         && last_was_zwj == false 
         && bytes[pos-1] < 0x80
         && bytes[pos-2] < 0x80
         {
-            if let Some(res) = maybe_process_ascii_window(bytes, pos) {
-                let mut breaks = res.breaks;
-                
-                let mut start = 0;
-                while breaks != 0 {
-                    let next_break = breaks.trailing_zeros();
+            while pos + WINDOW + 3 < bytes.len() {
+                if let Some(res) = maybe_process_ascii_window(bytes, pos) {
+                    let mut breaks = res.breaks;
                     
-                    let prop_mask: u16 = (1u16 << next_break) - (1u16 << start);
-
-                    token_props.0 |= ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
-                    token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
-                    
-                    if !on_breakpoint(pos + next_break as usize, std::mem::take(&mut token_props)) {
-                        return;
+                    let mut start = 0;
+                    while breaks != 0 {
+                        let next_break = breaks.trailing_zeros();
+                        let prop_mask: u16 = (1u16 << next_break) - (1u16 << start);
+    
+                        token_props.0 |= ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
+                        token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
+                        
+                        if !on_breakpoint(pos + next_break as usize, std::mem::take(&mut token_props)) {
+                            return;
+                        }
+    
+                        start = next_break;
+                        breaks &= breaks - 1;
                     }
+    
+                    
+                    // handoff to the next window, we will need to handoff tokenprops
+                    // Process the next window
+    
+                    // handoof token props to continue into the next window
+                    // we already zero'd out other tokens so theres no mask required               
+                    let prop_mask: u16 =((1u32 << 16) - (1u32 << start)) as u16;
+                    token_props.0 = ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
+                    token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
+    
+                    pos += WINDOW;
+                    
 
-                    start = next_break;
-                    breaks &= breaks - 1;
+                    //continue;
+                } else {
+                    break;
                 }
-
-                
-                // handoff to the next window, we will need to handoff tokenprops
-                // Process the next window
-
-                // handoof token props to continue into the next window
-                // we already zero'd out other tokens so theres no mask required               
-                let prop_mask: u16 =((1u32 << 16) - (1u32 << start)) as u16;
-                token_props.0 = ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
-                token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
-
-                pos += WINDOW;
-                state = match bytes[pos-1] {
-                    b'0'..=b'9' => State::Numeric,
-                    b'_' => State::ExtendNumLet,
-                    b'\t'..=b'\r' => State::WSegSpace,
-                    b' ' => State::WSegSpace,
-                    _ => State::ALetter,
-                };
-                continue;
             }
         }
 
