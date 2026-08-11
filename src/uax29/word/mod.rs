@@ -275,7 +275,7 @@ pub fn tokenize_windowed(
                 // Process the next window
 
                 // handoof token props to continue into the next window
-                // we already zero'd out other tokens so theres no mask required
+                // we already zero'd out other tokens so theres no mask required               
                 if remaining_tokens != 0 {
                     let word_like = ((res.word_like) != 0) as u8;
                     let ascii_upper = (((res.ascii_upper) != 0) as u8) << 2;
