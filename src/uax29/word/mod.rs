@@ -156,11 +156,14 @@ pub fn maybe_process_ascii_window(
     let mut is_lf: u32 = 0;
     let mut is_wseg: u32 = 0;
 
+    let mut high_bit_acc: u8 = 0; 
     for i in 0..(WINDOW + 2 + 1) {
         let b = bytes[pos -2 + i];
-        if b >= 0x80 {
-            return None
-        }
+        high_bit_acc |= b;
+    }
+
+    if high_bit_acc & 0x80 != 0 { 
+        return None;
     }
 
     let mask = 1;
@@ -257,10 +260,10 @@ pub fn tokenize_windowed(
                     while breaks != 0 {
                         let next_break = breaks.trailing_zeros();
                         let prop_mask: u16 = (1u16 << next_break) - (1u16 << start);
-    
-                        token_props.0 |= ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
-                        token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
-                        
+
+                        token_props.0 |= ((res.word_like & prop_mask != 0) as u8).wrapping_neg() & TokenProperties::WORD_LIKE_MASK;
+                        token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8)).wrapping_neg() & TokenProperties::HAS_ASCII_UPPER_MASK;
+
                         if !on_breakpoint(pos + next_break as usize, std::mem::take(&mut token_props)) {
                             return;
                         }
@@ -269,20 +272,16 @@ pub fn tokenize_windowed(
                         breaks &= breaks - 1;
                     }
     
-                    
                     // handoff to the next window, we will need to handoff tokenprops
                     // Process the next window
     
                     // handoof token props to continue into the next window
                     // we already zero'd out other tokens so theres no mask required               
                     let prop_mask: u16 =((1u32 << 16) - (1u32 << start)) as u16;
-                    token_props.0 = ((res.word_like & prop_mask != 0) as u8) & TokenProperties::WORD_LIKE_MASK;
-                    token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8) << 2) & TokenProperties::HAS_ASCII_UPPER_MASK;
+                    token_props.0 = ((res.word_like & prop_mask != 0) as u8).wrapping_neg() & TokenProperties::WORD_LIKE_MASK;
+                    token_props.0 |= ((res.ascii_upper & prop_mask != 0) as u8).wrapping_neg() & TokenProperties::HAS_ASCII_UPPER_MASK;
     
                     pos += WINDOW;
-                    
-
-                    //continue;
                 } else {
                     break;
                 }

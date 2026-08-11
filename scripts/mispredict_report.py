@@ -15,7 +15,7 @@ drops dyld / libobjc / malloc startup noise.
 """
 import argparse
 import json
-import sys
+import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
@@ -88,6 +88,45 @@ def pct(part, whole):
     return (100.0 * part / whole) if whole else 0.0
 
 
+# Path segments that only say *where* the code lives, never what it does.
+_NOISE = {
+    "alyze", "uax29", "word", "sentence", "properties", "transitions",
+    "core", "std", "alloc", "slice", "iter", "ops",
+    "wikipedia", "wikipedia_benchmark", "wikipedia_benchmarks", "criterion",
+}
+
+
+def short(name):
+    """Best-effort Rust v0 demangle.
+
+    v0 encodes each path segment as <len><ident>, so the identifier must be read
+    by *length* — a plain `\\d+(\\w+)` regex swallows the whole rest of the symbol
+    because `\\w` matches the digits of the following segment too.
+    """
+    m = re.search(r"\s*\[(.*?)\]\s*$", name)
+    if m:
+        name = name[: m.start()]
+    if not name.startswith("_R"):
+        return name
+
+    segments = []
+    for m in re.finditer(r"(\d+)", name):
+        n = int(m.group(1))
+        cand = name[m.end() : m.end() + n]
+        if len(cand) != n or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cand):
+            continue
+        # A candidate containing "<digit><letter>" is really several nested
+        # segments that happened to fit the length — e.g. a crate hash prefix.
+        if re.search(r"\d[A-Za-z]", cand):
+            continue
+        segments.append(cand)
+
+    for seg in segments:
+        if seg not in _NOISE and len(seg) >= 6:
+            return seg
+    return segments[-1] if segments else name
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("samples")
@@ -128,9 +167,32 @@ def main():
         rtotal = sum(fns.values())
         if rtotal < total * 0.02:
             continue
+
+        bfns = (base or {}).get("by_fn", {}).get(remark, {})
+        brtotal = sum(bfns.values())
+
         print(f"\n  {remark} — top frames")
-        for fn, w in sorted(fns.items(), key=lambda kv: -kv[1])[: args.top]:
-            print(f"    {w:>12,.0f} {pct(w, rtotal):>6.1f}%  {fn[:96]}")
+        if base:
+            # Share is the number that matters: a lower total with unchanged shares means
+            # everything scaled down (or the sample threshold moved), whereas a share that
+            # falls while others hold means that call site specifically got better.
+            print(
+                f"    {'weight':>10} {'share':>7} | {'base':>10} {'share':>7} | "
+                f"{'Δshare':>8}  function"
+            )
+        keys = sorted(set(fns) | set(bfns), key=lambda k: -max(fns.get(k, 0), bfns.get(k, 0)))
+        for fn in keys[: args.top]:
+            w, b = fns.get(fn, 0.0), bfns.get(fn, 0.0)
+            share, bshare = pct(w, rtotal), pct(b, brtotal)
+            if base:
+                dpp = share - bshare
+                mark = "  " if abs(dpp) < 1.0 else ("^^" if dpp > 0 else "vv")
+                print(
+                    f"    {w:>10,.0f} {share:>6.1f}% | {b:>10,.0f} {bshare:>6.1f}% | "
+                    f"{dpp:>+7.1f}pp {mark} {short(fn)[:70]}"
+                )
+            else:
+                print(f"    {w:>10,.0f} {share:>6.1f}%  {short(fn)[:88]}")
 
     if args.save:
         with open(args.save, "w") as f:
