@@ -52,5 +52,8 @@ fn main() {
 
     // `black_box` on the input so the optimiser cannot fold the corpus into constants.
     let (tokens, word_like, upper) = run(black_box(&text));
-    println!("bytes={} tokens={tokens} word_like={word_like} has_upper={upper}", text.len());
+    println!(
+        "bytes={} tokens={tokens} word_like={word_like} has_upper={upper}",
+        text.len()
+    );
 }

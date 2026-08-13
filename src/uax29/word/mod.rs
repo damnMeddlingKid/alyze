@@ -6,6 +6,7 @@ use properties::{
     ASCII_WORD_BREAK_PROP, WordBreakProperty, is_word_like_strict,
     lookup_word_break_property_from_dictionary,
 };
+use std::arch::aarch64::*;
 use transitions::{State, TABLE, Transition};
 
 /// For backwards compatibility, require caller to pass in options struct.
@@ -59,13 +60,13 @@ impl std::ops::BitOrAssign for TokenProperties {
 }
 
 // All the ascii break rules
-// 
+//
 #[inline]
 pub fn ascii_is_break(
-    previous2: WordBreakProperty, 
-    previous1: WordBreakProperty, 
-    current:WordBreakProperty, 
-    next: WordBreakProperty
+    previous2: WordBreakProperty,
+    previous1: WordBreakProperty,
+    current: WordBreakProperty,
+    next: WordBreakProperty,
 ) -> bool {
     // We will check all non breaking rules and then invert that so we break in all other cases
     // All non breaking rules that only have ascii
@@ -85,25 +86,27 @@ pub fn ascii_is_break(
     // Do not break from extenders.
     // WB13a - (AHLetter | Numeric | ExtendNumLet) × ExtendNumLet
     // WB13b - ExtendNumLet	× (AHLetter | Numeric)
-    use WordBreakProperty::{CR, LF, ALetter, WSegSpace, MidLetter, SingleQuote, Numeric, ExtendNumLet, MidNumLet, MidNum
+    use WordBreakProperty::{
+        ALetter, CR, ExtendNumLet, LF, MidLetter, MidNum, MidNumLet, Numeric, SingleQuote,
+        WSegSpace,
     };
-    
+
     // let do_not_break = (previous1 == CR) & (current == LF) // WB3
     //     | (previous1 == WSegSpace) & (current == WSegSpace) // WB3d
     //     | matches!(previous1, ALetter) & matches!(current, ALetter) // WB5
     //     | (matches!(previous1, ALetter)
     //     & (matches!(current, MidLetter | MidNumLet | SingleQuote))
     //     & matches!(next, ALetter)) // WB6
-    //     | (matches!(previous2, ALetter) 
+    //     | (matches!(previous2, ALetter)
     //     & (matches!(previous1, MidLetter | MidNumLet | SingleQuote))
     //     & matches!(current, ALetter)) // WB7
     //     | (previous1 == Numeric) & (current == Numeric) // WB8
     //     | matches!(previous1, ALetter) & (current == Numeric) // WB9
     //     | (previous1 == Numeric) & matches!(current, ALetter) // WB10
-    //     | ((previous2 == Numeric) 
+    //     | ((previous2 == Numeric)
     //     & matches!(previous1, MidNum | MidNumLet | SingleQuote)
     //     & (current == Numeric)) // WB11
-    //     | ((previous1 == Numeric) 
+    //     | ((previous1 == Numeric)
     //     & matches!(current, MidNum | MidNumLet | SingleQuote)
     //     & (next == Numeric)) // WB12
     //     | (matches!(previous1, ALetter | Numeric | ExtendNumLet)
@@ -137,13 +140,54 @@ pub fn ascii_is_break(
 pub struct WindowTokens {
     pub breaks: u16,
     pub word_like: u16,
-    pub ascii_upper: u16
+    pub ascii_upper: u16,
 }
 
-#[inline]
-pub fn maybe_process_ascii_window(
-    bytes: &[u8], 
-    pos: usize
+pub fn neonmovemask_bulk(p0: uint8x16_t, p1: uint8x16_t, p2: uint8x16_t, p3: uint8x16_t) -> u64 {
+    unsafe {
+        let bitmask1: uint8x16_t = vld1q_u8(
+            [
+                0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10,
+                0x01, 0x10,
+            ]
+            .as_ptr(),
+        );
+        let bitmask2: uint8x16_t = vld1q_u8(
+            [
+                0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20,
+                0x02, 0x20,
+            ]
+            .as_ptr(),
+        );
+        let bitmask3: uint8x16_t = vld1q_u8(
+            [
+                0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40,
+                0x04, 0x40,
+            ]
+            .as_ptr(),
+        );
+        let bitmask4: uint8x16_t = vld1q_u8(
+            [
+                0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80,
+                0x08, 0x80,
+            ]
+            .as_ptr(),
+        );
+        let t0: uint8x16_t = vandq_u8(p0, bitmask1);
+        let t1: uint8x16_t = vbslq_u8(bitmask2, p1, t0);
+        let t2: uint8x16_t = vbslq_u8(bitmask3, p2, t1);
+        let tmp: uint8x16_t = vbslq_u8(bitmask4, p3, t2);
+        let sum: uint8x16_t = vpaddq_u8(tmp, tmp);
+        vgetq_lane_u64(vreinterpretq_u64_u8(sum), 0)
+    }
+}
+
+#[inline(always)]
+pub fn maybe_process_ascii_window_neon(
+    bytes: &[u8],
+    pos: usize,
+    top: uint8x16x4_t,
+    bottom: uint8x16x4_t,
 ) -> Option<WindowTokens> {
     let mut word_like: u32 = 0;
     let mut ascii_upper: u32 = 0;
@@ -156,51 +200,121 @@ pub fn maybe_process_ascii_window(
     let mut is_lf: u32 = 0;
     let mut is_wseg: u32 = 0;
 
-    let mut high_bit_acc: u8 = 0; 
+    let mut high_bit_acc: u8 = 0;
     for i in 0..(WINDOW + 2 + 1) {
-        let b = bytes[pos -2 + i];
+        let b = bytes[pos - 2 + i];
         high_bit_acc |= b;
     }
 
-    if high_bit_acc & 0x80 != 0 { 
+    if high_bit_acc & 0x80 != 0 {
+        return None;
+    }
+
+    unsafe {
+        let input: uint8x16_t = vld1q_u8(bytes.as_ptr().add(pos));
+        let top_tokens = vqtbl4q_u8(top, input);
+        let bottom_tokens = vqtbl4q_u8(bottom, vsubq_u8(input, vdupq_n_u8(64)));
+        let tokens = vorrq_u8(top_tokens, bottom_tokens);
+        let mask = 1;
+        let is_mid_let_v = vceqq_u8(tokens, vdupq_n_u8(mask));
+        let is_mid_num_v = vceqq_u8(tokens, vdupq_n_u8(mask << 1));
+        let is_extend_v = vceqq_u8(tokens, vdupq_n_u8(mask << 2));
+        let is_letter_v = vceqq_u8(tokens, vdupq_n_u8(mask << 3));
+    }
+
+    for i in 0..(WINDOW + 2 + 1) {
+        is_mid_let |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask)) << i;
+        is_mid_num |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 1)) >> 1 << i;
+        is_extend |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 2)) >> 2 << i;
+        is_letter |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 3)) >> 3 << i;
+        is_numeric |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 4)) >> 4 << i;
+        is_cr |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 5)) >> 5 << i;
+        is_lf |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 6)) >> 6 << i;
+        is_wseg |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 7)) >> 7 << i;
+        word_like |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 8)) >> 8 << i;
+        ascii_upper |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 9)) >> 9 << i;
+    }
+
+    let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
+    let wb6wb7 = wb6 | (wb6 << 1);
+
+    let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
+    let wb11wb12 = wb12 | (wb12 << 1);
+
+    let wbex1 = is_extend & (is_extend << 1);
+    let wbcrlf = is_lf & (is_cr << 1);
+
+    let wbwseg = is_wseg & (is_wseg << 1);
+
+    let do_not_break = wb6wb7 | wb11wb12 | wbex1 | wbcrlf | wbwseg;
+    let breaks = !(do_not_break >> 2) as u16;
+
+    Some(WindowTokens {
+        breaks: breaks,
+        word_like: (word_like >> 2) as u16,
+        ascii_upper: (ascii_upper >> 2) as u16,
+    })
+}
+
+#[inline]
+pub fn maybe_process_ascii_window(bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+    let mut word_like: u32 = 0;
+    let mut ascii_upper: u32 = 0;
+    let mut is_letter: u32 = 0;
+    let mut is_numeric: u32 = 0;
+    let mut is_mid_let: u32 = 0;
+    let mut is_mid_num: u32 = 0;
+    let mut is_extend: u32 = 0;
+    let mut is_cr: u32 = 0;
+    let mut is_lf: u32 = 0;
+    let mut is_wseg: u32 = 0;
+
+    let mut high_bit_acc: u8 = 0;
+    for i in 0..(WINDOW + 2 + 1) {
+        let b = bytes[pos - 2 + i];
+        high_bit_acc |= b;
+    }
+
+    if high_bit_acc & 0x80 != 0 {
         return None;
     }
 
     let mask = 1;
 
     for i in 0..(WINDOW + 2 + 1) {
-        is_mid_let |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask)) << i;
-        is_mid_num |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<1)) >> 1 << i;
-        is_extend |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<2)) >> 2 << i;
-        is_letter |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<3)) >> 3 << i;
-        is_numeric |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<4)) >> 4 << i;
-        is_cr |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<5)) >> 5 << i;
-        is_lf |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<6)) >> 6 << i;
-        is_wseg |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<7)) >> 7 << i;
-        word_like |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<8)) >> 8 << i;
-        ascii_upper |= ((ASCII_CUSTOM[bytes[pos -2 + i] as usize] as u32) & (mask<<9)) >> 9 << i;
+        let idx = ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32;
+        is_mid_let |= (idx & (mask)) << i;
+        is_mid_num |= (idx & (mask << 1)) >> 1 << i;
+        is_extend |= (idx & (mask << 2)) >> 2 << i;
+        is_letter |= (idx & (mask << 3)) >> 3 << i;
+        is_numeric |= (idx & (mask << 4)) >> 4 << i;
+        is_cr |= (idx & (mask << 5)) >> 5 << i;
+        is_lf |= (idx & (mask << 6)) >> 6 << i;
+        is_wseg |= (idx & (mask << 7)) >> 7 << i;
+        word_like |= (idx & (mask << 8)) >> 8 << i;
+        ascii_upper |= (idx & (mask << 9)) >> 9 << i;
     }
 
     /*
-     | ((previous1 == ALetter)
-     & matches!(current, MidLetter | MidNumLet | SingleQuote)
-     & (next == ALetter)) // WB6
-     | ((previous2 == ALetter)
-     & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
-     & (current == ALetter)) // WB7
-     */
+    | ((previous1 == ALetter)
+    & matches!(current, MidLetter | MidNumLet | SingleQuote)
+    & (next == ALetter)) // WB6
+    | ((previous2 == ALetter)
+    & matches!(previous1, MidLetter | MidNumLet | SingleQuote)
+    & (current == ALetter)) // WB7
+    */
 
-    let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1); 
+    let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
     let wb6wb7 = wb6 | (wb6 << 1);
 
-     /*
-     | ((previous1 == Numeric)
-     & matches!(current, MidNum | MidNumLet | SingleQuote)
-     & (next == Numeric)) // WB12
-     | ((previous2 == Numeric)
-     & matches!(previous1, MidNum | MidNumLet | SingleQuote)
-     & (current == Numeric)) // WB11
-      */
+    /*
+    | ((previous1 == Numeric)
+    & matches!(current, MidNum | MidNumLet | SingleQuote)
+    & (next == Numeric)) // WB12
+    | ((previous2 == Numeric)
+    & matches!(previous1, MidNum | MidNumLet | SingleQuote)
+    & (current == Numeric)) // WB11
+     */
     let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
     let wb11wb12 = wb12 | (wb12 << 1);
 
@@ -220,7 +334,11 @@ pub fn maybe_process_ascii_window(
     let do_not_break = wb6wb7 | wb11wb12 | wbex1 | wbcrlf | wbwseg;
     let breaks = !(do_not_break >> 2) as u16;
 
-    Some(WindowTokens{breaks:breaks, word_like: (word_like >> 2) as u16, ascii_upper: (ascii_upper >> 2) as u16})
+    Some(WindowTokens {
+        breaks: breaks,
+        word_like: (word_like >> 2) as u16,
+        ascii_upper: (ascii_upper >> 2) as u16,
+    })
 }
 
 pub fn tokenize_windowed(
@@ -240,47 +358,54 @@ pub fn tokenize_windowed(
     let mut last_was_zwj = false;
     let mut token_props = TokenProperties::default();
     let mut deferred_props = TokenProperties::default();
-    
+
     while pos < text.len() {
         // ACII Windowed fast path
         // We only accept all ascii windows
         // We dont handoff state from the scalar parsing to the window
-        if pos >= 2 
-        && pos + WINDOW + 3 < bytes.len()
-        && deferred_break_pos.is_none()
-        && last_was_zwj == false 
-        && bytes[pos-1] < 0x80
-        && bytes[pos-2] < 0x80
+        if pos >= 2
+            && pos + WINDOW + 3 < bytes.len()
+            && deferred_break_pos.is_none()
+            && last_was_zwj == false
+            && bytes[pos - 1] < 0x80
+            && bytes[pos - 2] < 0x80
         {
             while pos + WINDOW + 3 < bytes.len() {
                 if let Some(res) = maybe_process_ascii_window(bytes, pos) {
                     let mut breaks = res.breaks;
-                    
+
                     let mut start = 0;
                     while breaks != 0 {
                         let next_break = breaks.trailing_zeros();
                         let prop_mask: u16 = (1u16 << next_break) - (1u16 << start);
 
-                        token_props.0 |= ((res.word_like & prop_mask != 0) as u8).wrapping_neg() & TokenProperties::WORD_LIKE_MASK;
-                        token_props.0 |= (((res.ascii_upper & prop_mask != 0) as u8)).wrapping_neg() & TokenProperties::HAS_ASCII_UPPER_MASK;
+                        token_props.0 |= ((res.word_like & prop_mask != 0) as u8).wrapping_neg()
+                            & TokenProperties::WORD_LIKE_MASK;
+                        token_props.0 |= ((res.ascii_upper & prop_mask != 0) as u8).wrapping_neg()
+                            & TokenProperties::HAS_ASCII_UPPER_MASK;
 
-                        if !on_breakpoint(pos + next_break as usize, std::mem::take(&mut token_props)) {
+                        if !on_breakpoint(
+                            pos + next_break as usize,
+                            std::mem::take(&mut token_props),
+                        ) {
                             return;
                         }
-    
+
                         start = next_break;
                         breaks &= breaks - 1;
                     }
-    
+
                     // handoff to the next window, we will need to handoff tokenprops
                     // Process the next window
-    
+
                     // handoof token props to continue into the next window
-                    // we already zero'd out other tokens so theres no mask required               
-                    let prop_mask: u16 =((1u32 << 16) - (1u32 << start)) as u16;
-                    token_props.0 = ((res.word_like & prop_mask != 0) as u8).wrapping_neg() & TokenProperties::WORD_LIKE_MASK;
-                    token_props.0 |= ((res.ascii_upper & prop_mask != 0) as u8).wrapping_neg() & TokenProperties::HAS_ASCII_UPPER_MASK;
-    
+                    // we already zero'd out other tokens so theres no mask required
+                    let prop_mask: u16 = ((1u32 << 16) - (1u32 << start)) as u16;
+                    token_props.0 = ((res.word_like & prop_mask != 0) as u8).wrapping_neg()
+                        & TokenProperties::WORD_LIKE_MASK;
+                    token_props.0 |= ((res.ascii_upper & prop_mask != 0) as u8).wrapping_neg()
+                        & TokenProperties::HAS_ASCII_UPPER_MASK;
+
                     pos += WINDOW;
                 } else {
                     break;
@@ -654,24 +779,57 @@ const ASCII_CUSTOM: [u16; 128] = {
             is_cr |= ((classes[i] == CR) as u32) << i;
             is_lf |= ((classes[i] == LF) as u32) << i;
             is_wseg |= ((classes[i] == WSegSpace) as u32) << i;
-            
+
             word_like |= ((info[i] & TokenProperties::WORD_LIKE_MASK) as u32) << i;
             ascii_upper |= ((info[i] & TokenProperties::HAS_ASCII_UPPER_MASK) as u32 >> 2) << i;
              */
-            let mid_let = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::MidLetter | WordBreakProperty::MidNumLet | WordBreakProperty::SingleQuote) as u16;
-            let mid_num = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::MidNum | WordBreakProperty::MidNumLet | WordBreakProperty::SingleQuote) as u16;
-            let extend = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::ALetter | WordBreakProperty::Numeric | WordBreakProperty::ExtendNumLet) as u16;
-            let letter = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::ALetter) as u16;
-            let numeric = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::Numeric) as u16;
+            let mid_let = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::MidLetter
+                    | WordBreakProperty::MidNumLet
+                    | WordBreakProperty::SingleQuote
+            ) as u16;
+            let mid_num = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::MidNum
+                    | WordBreakProperty::MidNumLet
+                    | WordBreakProperty::SingleQuote
+            ) as u16;
+            let extend = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::ALetter
+                    | WordBreakProperty::Numeric
+                    | WordBreakProperty::ExtendNumLet
+            ) as u16;
+            let letter = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::ALetter
+            ) as u16;
+            let numeric = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::Numeric
+            ) as u16;
             let cr = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::CR) as u16;
             let lf = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::LF) as u16;
-            let wseg = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::WSegSpace) as u16;
+            let wseg = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::WSegSpace
+            ) as u16;
             let word_like = (ASCII_BYTE_INFO[i as usize] & TokenProperties::WORD_LIKE_MASK) as u16;
-            let ascii_upper = ((ASCII_BYTE_INFO[i as usize] & TokenProperties::HAS_ASCII_UPPER_MASK) >> 2) as u16;
-            mid_let | (mid_num << 1) | (extend << 2) | (letter << 3) | (numeric << 4) | (cr << 5) | (lf << 6) | (wseg << 7)
-            | (word_like << 8) | (ascii_upper << 9)
+            let ascii_upper =
+                ((ASCII_BYTE_INFO[i as usize] & TokenProperties::HAS_ASCII_UPPER_MASK) >> 2) as u16;
+            mid_let
+                | (mid_num << 1)
+                | (extend << 2)
+                | (letter << 3)
+                | (numeric << 4)
+                | (cr << 5)
+                | (lf << 6)
+                | (wseg << 7)
+                | (word_like << 8)
+                | (ascii_upper << 9)
         };
-        
+
         if i == 127 {
             break;
         }
@@ -679,6 +837,133 @@ const ASCII_CUSTOM: [u16; 128] = {
     }
     t
 };
+
+static ASCII_CUSTOM_BYTE: [u8; 128] = {
+    let mut t = [0u8; 128];
+    let mut i = 0u8;
+    loop {
+        t[i as usize] = {
+            /*
+            is_letter |= ((classes[i] == ALetter) as u32) << i;
+            is_numeric |= ((classes[i] == Numeric) as u32) << i;
+            is_cr |= ((classes[i] == CR) as u32) << i;
+            is_lf |= ((classes[i] == LF) as u32) << i;
+            is_wseg |= ((classes[i] == WSegSpace) as u32) << i;
+
+            word_like |= ((info[i] & TokenProperties::WORD_LIKE_MASK) as u32) << i;
+            ascii_upper |= ((info[i] & TokenProperties::HAS_ASCII_UPPER_MASK) as u32 >> 2) << i;
+             */
+            let mid_let = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::MidLetter
+                    | WordBreakProperty::MidNumLet
+                    | WordBreakProperty::SingleQuote
+            );
+            let mid_num = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::MidNum
+                    | WordBreakProperty::MidNumLet
+                    | WordBreakProperty::SingleQuote
+            );
+            let extend = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::ALetter
+                    | WordBreakProperty::Numeric
+                    | WordBreakProperty::ExtendNumLet
+            );
+            let letter = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::ALetter
+            );
+            let numeric = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::Numeric
+            );
+            let cr = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::CR);
+            let lf = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::LF);
+            let wseg = matches!(
+                ASCII_WORD_BREAK_PROP[i as usize],
+                WordBreakProperty::WSegSpace
+            );
+            let word_like = (ASCII_BYTE_INFO[i as usize] & TokenProperties::WORD_LIKE_MASK);
+            let ascii_upper =
+                ((ASCII_BYTE_INFO[i as usize] & TokenProperties::HAS_ASCII_UPPER_MASK) >> 2);
+            mid_let
+                | (mid_num << 1)
+                | (extend << 2)
+                | (letter << 3)
+                | (numeric << 4)
+                | (cr << 5)
+                | (lf << 6)
+                | (wseg << 7)
+        };
+
+        if i == 127 {
+            break;
+        }
+        i += 1;
+    }
+    t
+};
+
+#[inline(always)]
+pub fn load_table_128(table: &[u8; 128]) -> (uint8x16x4_t, uint8x16x4_t) {
+    // SAFETY: `table` is exactly 128 bytes, so both 64-byte loads are in bounds.
+    // NEON is baseline on aarch64.
+    unsafe {
+        (
+            vld1q_u8_x4(table.as_ptr()),
+            vld1q_u8_x4(table.as_ptr().add(64)),
+        )
+    }
+}
+
+pub trait WindowProcessor: Copy {
+    fn new() -> Self;
+    fn process(&self, bytes: &[u8], pos: usize) -> Option<WindowTokens>;
+}
+
+#[derive(Clone, Copy)]
+pub struct Scalar;
+
+impl WindowProcessor for Scalar {
+    #[inline(always)]
+    fn new() -> Self {
+        Scalar
+    }
+
+    #[inline(always)]
+    fn process(&self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+        maybe_process_ascii_window(bytes, pos)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct Neon {
+    top: uint8x16x4_t,
+    bottom: uint8x16x4_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl WindowProcessor for Neon {
+    #[inline(always)]
+    fn new() -> Self {
+        // SAFETY: table is 128 bytes; NEON is baseline on aarch64.
+        unsafe {
+            let p = ASCII_CUSTOM_BYTE.as_ptr();
+            Neon {
+                top: vld1q_u8_x4(p),
+                bottom: vld1q_u8_x4(p.add(64)),
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn process(&self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+        maybe_process_ascii_window_neon(bytes, pos, self.top, self.bottom)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -724,7 +1009,10 @@ mod tests {
         const PADS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 31, 33];
         // Long enough on its own to satisfy `pos + WINDOW < len` after the body ends.
         const TAIL: &str = " the quick brown fox jumps over it";
-        const _: () = assert!(TAIL.len() > WINDOW + 2, "tail too short to reach the fast path");
+        const _: () = assert!(
+            TAIL.len() > WINDOW + 2,
+            "tail too short to reach the fast path"
+        );
 
         let mut mismatches = Vec::new();
         let mut total_mismatches = 0usize;
@@ -817,7 +1105,11 @@ mod tests {
             // Katakana.
             ("\r\u{0308}\u{3031}", &[0, 1, 3, 6], "extend then Katakana"),
             ("\n\u{0308}\u{3031}", &[0, 1, 3, 6], "extend then Katakana"),
-            ("\u{000B}\u{0308}\u{3031}", &[0, 1, 3, 6], "extend then Katakana"),
+            (
+                "\u{000B}\u{0308}\u{3031}",
+                &[0, 1, 3, 6],
+                "extend then Katakana",
+            ),
             // Other non-ASCII.
             ("'\u{24C2}", &[0, 1, 4], "SingleQuote then ExtPict"),
             ("\u{00A9}A", &[0, 2, 3], "Other non-ASCII then ASCII"),
@@ -828,16 +1120,32 @@ mod tests {
             ("a:\u{0308}A", &[0, 5], "extend inside letter bridge"),
             ("1.\u{2060}0", &[0, 6], "format inside numeric bridge"),
             ("a'\u{2060}A", &[0, 6], "format inside letter bridge"),
-            ("1.\u{2060}\u{0308}0", &[0, 8], "format+extend inside bridge"),
+            (
+                "1.\u{2060}\u{0308}0",
+                &[0, 8],
+                "format+extend inside bridge",
+            ),
             ("a'\u{05D0}", &[0, 4], "bridge into Hebrew"),
             ("a:\u{05D0}", &[0, 4], "bridge into Hebrew"),
             ("\u{05D0}\"\u{05D0}", &[0, 5], "Hebrew DoubleQuote bridge"),
             ("a:\u{24C2}", &[0, 5], "bridge into ExtPict"),
             ("a'\u{24C2}", &[0, 5], "bridge into ExtPict"),
             // Window alignment: the non-ASCII byte lands before, on, and after the 16-byte edge.
-            ("aaaaaaaaaaaaaaa\u{0300}bbbb", &[0, 21], "non-ASCII at offset 15"),
-            ("aaaaaaaaaaaaaaaa\u{0300}bbbb", &[0, 22], "non-ASCII at offset 16"),
-            ("aaaaaaaaaaaaaaaaa\u{0300}bbbb", &[0, 23], "non-ASCII at offset 17"),
+            (
+                "aaaaaaaaaaaaaaa\u{0300}bbbb",
+                &[0, 21],
+                "non-ASCII at offset 15",
+            ),
+            (
+                "aaaaaaaaaaaaaaaa\u{0300}bbbb",
+                &[0, 22],
+                "non-ASCII at offset 16",
+            ),
+            (
+                "aaaaaaaaaaaaaaaaa\u{0300}bbbb",
+                &[0, 23],
+                "non-ASCII at offset 17",
+            ),
         ];
 
         let mut failures = Vec::new();
@@ -890,9 +1198,6 @@ mod tests {
         );
     }
 
-
-
-
     #[test]
     fn test_word_break_against_uax29_tests() {
         let (passed, failed) =
@@ -926,10 +1231,10 @@ mod tests {
             });
             assert_eq!(actual, expected, "input: {:?}", s);
         }
-        
+
         assert_breaks("can'");
     }
-    
+
     #[test]
     fn tokenizer_sanity() {
         fn assert_breaks(s: &str, expected: Vec<usize>) {
@@ -1237,7 +1542,12 @@ mod tests {
         assert!(
             failures.is_empty(),
             "{}\n\n{} / {checked} padded inputs disagree on token properties",
-            failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n"),
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
             failures.len(),
         );
     }
