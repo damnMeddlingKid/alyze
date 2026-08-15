@@ -143,6 +143,15 @@ pub struct WindowTokens {
     pub ascii_upper: u16,
 }
 
+pub struct NeonWindowTokens {
+    pub breaks: u16,
+    pub word_like: u16,
+    pub ascii_upper: u16,
+    pub current_lo: uint8x16_t,
+    pub current_hi: uint8x16_t,
+}
+
+#[inline(always)]
 pub fn neonmovemask_bulk(p0: uint8x16_t, p1: uint8x16_t, p2: uint8x16_t, p3: uint8x16_t) -> u64 {
     unsafe {
         let bitmask1: uint8x16_t = vld1q_u8(
@@ -183,22 +192,31 @@ pub fn neonmovemask_bulk(p0: uint8x16_t, p1: uint8x16_t, p2: uint8x16_t, p3: uin
 }
 
 #[inline(always)]
+pub fn table_lookup(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> (uint8x16_t, uint8x16_t) {
+    unsafe {
+        let input: uint8x16_t = vld1q_u8(bytes.as_ptr());
+        let top_tokens = vqtbl4q_u8(top, input);
+        let bottom_tokens = vqtbl4q_u8(bottom, vsubq_u8(input, vdupq_n_u8(64)));
+        let current = vorrq_u8(top_tokens, bottom_tokens);
+        let even_tokens = vuzp1q_u8(current, current);
+        let odd_tokens = vuzp2q_u8(current, current);
+        let lo = vsliq_n_u8::<4>(odd_tokens, even_tokens);
+        let hi = vsriq_n_u8::<4>(even_tokens, odd_tokens);
+        (lo, hi)
+    }
+}
+
+#[inline(always)]
 pub fn maybe_process_ascii_window_neon(
     bytes: &[u8],
     pos: usize,
     top: uint8x16x4_t,
     bottom: uint8x16x4_t,
-) -> Option<WindowTokens> {
+    previous_lo: uint8x16_t,
+    previous_hi: uint8x16_t,
+) -> Option<NeonWindowTokens> {
     let mut word_like: u32 = 0;
     let mut ascii_upper: u32 = 0;
-    let mut is_letter: u32 = 0;
-    let mut is_numeric: u32 = 0;
-    let mut is_mid_let: u32 = 0;
-    let mut is_mid_num: u32 = 0;
-    let mut is_extend: u32 = 0;
-    let mut is_cr: u32 = 0;
-    let mut is_lf: u32 = 0;
-    let mut is_wseg: u32 = 0;
 
     let mut high_bit_acc: u8 = 0;
     for i in 0..(WINDOW + 2 + 1) {
@@ -210,50 +228,105 @@ pub fn maybe_process_ascii_window_neon(
         return None;
     }
 
+    #[inline(always)]
+    unsafe fn shl_nibble(v: uint8x16_t) -> uint8x16_t {
+        let nxt = vextq_u8::<1>(v, vdupq_n_u8(0));
+        vsriq_n_u8::<4>(vshlq_n_u8::<4>(v), nxt)
+    }
+
+    #[inline(always)]
+    unsafe fn shr_nibble(v: uint8x16_t) -> uint8x16_t {
+        let prv = vextq_u8::<15>(vdupq_n_u8(0), v);
+        vsliq_n_u8::<4>(vshrq_n_u8::<4>(v), prv)
+    }
+
     unsafe {
-        let input: uint8x16_t = vld1q_u8(bytes.as_ptr().add(pos));
-        let top_tokens = vqtbl4q_u8(top, input);
-        let bottom_tokens = vqtbl4q_u8(bottom, vsubq_u8(input, vdupq_n_u8(64)));
-        let tokens = vorrq_u8(top_tokens, bottom_tokens);
-        let mask = 1;
-        let is_mid_let_v = vceqq_u8(tokens, vdupq_n_u8(mask));
-        let is_mid_num_v = vceqq_u8(tokens, vdupq_n_u8(mask << 1));
-        let is_extend_v = vceqq_u8(tokens, vdupq_n_u8(mask << 2));
-        let is_letter_v = vceqq_u8(tokens, vdupq_n_u8(mask << 3));
+        // let input: uint8x16_t = vld1q_u8(bytes.as_ptr().add(pos));
+        // let top_tokens = vqtbl4q_u8(top, input);
+        // let bottom_tokens = vqtbl4q_u8(bottom, vsubq_u8(input, vdupq_n_u8(64)));
+        // let current = vorrq_u8(top_tokens, bottom_tokens);
+        // let even_tokens = vuzp1q_u8(current, current);
+        // let odd_tokens = vuzp2q_u8(current, current);
+        // let current_lo = vsliq_n_u8::<4>(odd_tokens, even_tokens);
+        // let current_hi = vsriq_n_u8::<4>(even_tokens, odd_tokens);
+        // TODO: lets accept a  &[u8; WINDOW]) in the functiono args
+        let (current_lo, current_hi) = table_lookup(top, bottom, &bytes[pos..pos + 16]);
+
+        let previous2_lo = vextq_u8::<14>(previous_lo, current_lo);
+        let previous2_hi = vextq_u8::<14>(previous_hi, current_hi);
+
+        let next_token = ASCII_CUSTOM[bytes[pos + 1] as usize] as u8;
+
+        let full_lo = vextq_u8::<1>(previous2_lo, vdupq_n_u8(next_token & 0x0F));
+        let full_hi = vextq_u8::<1>(previous2_hi, vdupq_n_u8((next_token >> 4) & 0x0F));
+
+        // let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
+        // let wb6wb7 = wb6 | (wb6 << 1);
+        // let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
+        // let wb11wb12 = wb12 | (wb12 << 1);
+        
+        let wb6 = vandq_u8(
+            shr_nibble(full_lo),
+            vandq_u8(shl_nibble(full_lo), vshrq_n_u8(full_lo, 3)),
+        );
+        let wb6wb7 = vorrq_u8(wb6, vextq_u8::<1>(vdupq_n_u8(0), wb6));
+
+        let wb12 = vandq_u8(
+            shr_nibble(full_hi),
+            vandq_u8(shl_nibble(full_hi), vshrq_n_u8(full_lo, 1)),
+        );
+        let wb11wb12 = vorrq_u8(wb12, vextq_u8::<1>(vdupq_n_u8(0), wb12));
+
+        let wbex1 = vshrq_n_u8(vandq_u8(full_lo, shl_nibble(full_lo)), 2);
+        let wbwseg = vshrq_n_u8(vandq_u8(full_hi, shl_nibble(full_hi)), 2);
+        let wbcrlf = vshrq_n_u8(vandq_u8(full_hi, shl_nibble(vshlq_n_u8(full_hi, 1))), 3);
+
+        let a = vorrq_u8(wb6wb7, wb11wb12);
+        let b = vorrq_u8(wbex1, wbwseg);
+        let do_not_break = vorrq_u8(vorrq_u8(a, b), wbcrlf);
+        
+        let mut breaks = vandq_u8(vmvnq_u8(do_not_break), vdupq_n_u8(0x11));
+        // we need to shift off the prev1 and prev2 bits
+        breaks = vextq_u8::<1>(breaks, vdupq_n_u8(0));
+        let mut breaks_mask = vandq_u8(vorrq_u8(vshrq_n_u8(breaks, 3), breaks), vdupq_n_u8(0x03));
+
+        breaks_mask = vorrq_u8(
+            vshlq_n_u8(vextq_u8::<1>(breaks_mask, vdupq_n_u8(0)), 2),
+            breaks_mask,
+        );
+        breaks_mask = vorrq_u8(
+            vshlq_n_u8(vextq_u8::<2>(breaks_mask, vdupq_n_u8(0)), 4),
+            breaks_mask,
+        );
+
+        let scalar_breaks = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(breaks_mask));
+
+        let bit_breaks = ((scalar_breaks & 0xFF) | ((scalar_breaks >> 24) & 0xFF00)) as u16;
+
+        /*
+        * 0b000a000b000c000d000e000f000g000h000i000j000k000l000m000n000o000p
+        * 0b00000000000a000b000c000d000e000f000g000h000i000j000k000l000m000n
+           v = 0b000a000b000c000d000e000f000g000h000i000j000k000l000m000n000o000p
+           v = vshrq_n_u8(3) | v
+           v = 0b000000ab000000cd000000ef000000gh000000ij000000kl000000mn000000op
+           v = vshlq_n_u8(vext(>> 1), 2) | v
+               0b000000ab|000000cd|000000ef|000000gh|000000ij|000000kl|000000mn|000000op
+               0b00000000|0000ab00|0000cd00|0000ef00|0000gh00|0000ij00|0000kl00|0000mn00
+           v = 0b000000ab|0000abcd|0000cdef|0000efgh|0000ghij|0000ijkl|0000klmn|0000mnop
+           v =  vshlq_n_u8(vext(>> 2), 4) | v
+               0b000000ab|0000abcd|0000cdef|0000efgh|0000ghij|0000ijkl|0000klmn|0000mnop
+               0b00000000|00000000|00ab0000|abcd0000|cdef0000|efgh0000|ghij0000|ijkl0000
+           v = 0b000000ab|0000abcd|00abcdef|abcdefgh|cdefghij|efghijkl|ghijklmn|ijklmnop
+        */
+
+        Some(NeonWindowTokens {
+            breaks: bit_breaks,
+            word_like: (word_like >> 2) as u16,
+            ascii_upper: (ascii_upper >> 2) as u16,
+            current_lo: current_lo,
+            current_hi: current_hi,
+        })
     }
-
-    for i in 0..(WINDOW + 2 + 1) {
-        is_mid_let |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask)) << i;
-        is_mid_num |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 1)) >> 1 << i;
-        is_extend |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 2)) >> 2 << i;
-        is_letter |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 3)) >> 3 << i;
-        is_numeric |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 4)) >> 4 << i;
-        is_cr |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 5)) >> 5 << i;
-        is_lf |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 6)) >> 6 << i;
-        is_wseg |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 7)) >> 7 << i;
-        word_like |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 8)) >> 8 << i;
-        ascii_upper |= ((ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32) & (mask << 9)) >> 9 << i;
-    }
-
-    let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
-    let wb6wb7 = wb6 | (wb6 << 1);
-
-    let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
-    let wb11wb12 = wb12 | (wb12 << 1);
-
-    let wbex1 = is_extend & (is_extend << 1);
-    let wbcrlf = is_lf & (is_cr << 1);
-
-    let wbwseg = is_wseg & (is_wseg << 1);
-
-    let do_not_break = wb6wb7 | wb11wb12 | wbex1 | wbcrlf | wbwseg;
-    let breaks = !(do_not_break >> 2) as u16;
-
-    Some(WindowTokens {
-        breaks: breaks,
-        word_like: (word_like >> 2) as u16,
-        ascii_upper: (ascii_upper >> 2) as u16,
-    })
 }
 
 #[inline]
@@ -343,8 +416,19 @@ pub fn maybe_process_ascii_window(bytes: &[u8], pos: usize) -> Option<WindowToke
 
 pub fn tokenize_windowed(
     text: &str,
+    options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    tokenize_windowed_with::<Neon, _>(text, options, on_breakpoint);
+    #[cfg(not(target_arch = "aarch64"))]
+    tokenize_windowed_with::<Scalar, _>(text, options, on_breakpoint);
+}
+
+pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenProperties) -> bool>(
+    text: &str,
     _options: Options,
-    mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+    mut on_breakpoint: F,
 ) {
     if text.is_empty() {
         return;
@@ -358,12 +442,13 @@ pub fn tokenize_windowed(
     let mut last_was_zwj = false;
     let mut token_props = TokenProperties::default();
     let mut deferred_props = TokenProperties::default();
+    let mut processor = P::new();
 
     while pos < text.len() {
         // ACII Windowed fast path
         // We only accept all ascii windows
         // We dont handoff state from the scalar parsing to the window
-        if pos >= 2
+        if pos >= P::MIN_POS
             && pos + WINDOW + 3 < bytes.len()
             && deferred_break_pos.is_none()
             && last_was_zwj == false
@@ -371,7 +456,7 @@ pub fn tokenize_windowed(
             && bytes[pos - 2] < 0x80
         {
             while pos + WINDOW + 3 < bytes.len() {
-                if let Some(res) = maybe_process_ascii_window(bytes, pos) {
+                if let Some(res) = processor.process(bytes, pos) {
                     let mut breaks = res.breaks;
 
                     let mut start = 0;
@@ -858,40 +943,38 @@ static ASCII_CUSTOM_BYTE: [u8; 128] = {
                 WordBreakProperty::MidLetter
                     | WordBreakProperty::MidNumLet
                     | WordBreakProperty::SingleQuote
-            );
+            ) as u8;
             let mid_num = matches!(
                 ASCII_WORD_BREAK_PROP[i as usize],
                 WordBreakProperty::MidNum
                     | WordBreakProperty::MidNumLet
                     | WordBreakProperty::SingleQuote
-            );
+            ) as u8;
             let extend = matches!(
                 ASCII_WORD_BREAK_PROP[i as usize],
                 WordBreakProperty::ALetter
                     | WordBreakProperty::Numeric
                     | WordBreakProperty::ExtendNumLet
-            );
+            ) as u8;
             let letter = matches!(
                 ASCII_WORD_BREAK_PROP[i as usize],
                 WordBreakProperty::ALetter
-            );
+            ) as u8;
             let numeric = matches!(
                 ASCII_WORD_BREAK_PROP[i as usize],
                 WordBreakProperty::Numeric
-            );
-            let cr = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::CR);
-            let lf = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::LF);
+            ) as u8;
+            let cr = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::CR) as u8;
+            let lf = matches!(ASCII_WORD_BREAK_PROP[i as usize], WordBreakProperty::LF) as u8;
             let wseg = matches!(
                 ASCII_WORD_BREAK_PROP[i as usize],
                 WordBreakProperty::WSegSpace
-            );
-            let word_like = (ASCII_BYTE_INFO[i as usize] & TokenProperties::WORD_LIKE_MASK);
-            let ascii_upper =
-                ((ASCII_BYTE_INFO[i as usize] & TokenProperties::HAS_ASCII_UPPER_MASK) >> 2);
-            mid_let
+            ) as u8;
+            
+            letter
                 | (mid_num << 1)
                 | (extend << 2)
-                | (letter << 3)
+                | (mid_let << 3)
                 | (numeric << 4)
                 | (cr << 5)
                 | (lf << 6)
@@ -919,21 +1002,27 @@ pub fn load_table_128(table: &[u8; 128]) -> (uint8x16x4_t, uint8x16x4_t) {
 }
 
 pub trait WindowProcessor: Copy {
+    /// Bytes of left context `process` reads before `pos`; the caller must not call `process`
+    /// with a smaller `pos`.
+    const MIN_POS: usize;
+
     fn new() -> Self;
-    fn process(&self, bytes: &[u8], pos: usize) -> Option<WindowTokens>;
+    fn process(&mut self, bytes: &[u8], pos: usize) -> Option<WindowTokens>;
 }
 
 #[derive(Clone, Copy)]
 pub struct Scalar;
 
 impl WindowProcessor for Scalar {
+    const MIN_POS: usize = 2;
+
     #[inline(always)]
     fn new() -> Self {
         Scalar
     }
 
     #[inline(always)]
-    fn process(&self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+    fn process(&mut self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
         maybe_process_ascii_window(bytes, pos)
     }
 }
@@ -943,10 +1032,16 @@ impl WindowProcessor for Scalar {
 pub struct Neon {
     top: uint8x16x4_t,
     bottom: uint8x16x4_t,
+    prev_pos: usize,
+    prev_hi: Option<uint8x16_t>,
+    prev_lo: Option<uint8x16_t>,
 }
 
 #[cfg(target_arch = "aarch64")]
 impl WindowProcessor for Neon {
+    // `process` table-looks-up the preceding window to seed prev_lo/prev_hi.
+    const MIN_POS: usize = WINDOW;
+
     #[inline(always)]
     fn new() -> Self {
         // SAFETY: table is 128 bytes; NEON is baseline on aarch64.
@@ -955,13 +1050,44 @@ impl WindowProcessor for Neon {
             Neon {
                 top: vld1q_u8_x4(p),
                 bottom: vld1q_u8_x4(p.add(64)),
+                prev_pos: 0,
+                prev_lo: None,
+                prev_hi: None,
             }
         }
     }
 
     #[inline(always)]
-    fn process(&self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
-        maybe_process_ascii_window_neon(bytes, pos, self.top, self.bottom)
+    fn process(&mut self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+        // The cached lookup is only the right left-context if this window directly follows the
+        // last one we processed; anything else (a scalar run in between, a rejected window) means
+        // we have to re-derive it.
+        let cached = match (self.prev_lo, self.prev_hi) {
+            (Some(lo), Some(hi)) if pos == self.prev_pos + WINDOW => Some((lo, hi)),
+            _ => None,
+        };
+        let (prev_lo, prev_hi) = match cached {
+            Some(prev) => prev,
+            None => table_lookup(self.top, self.bottom, &bytes[pos - WINDOW..pos]),
+        };
+
+        match maybe_process_ascii_window_neon(bytes, pos, self.top, self.bottom, prev_lo, prev_hi) {
+            Some(r) => {
+                self.prev_pos = pos;
+                self.prev_lo = Some(r.current_lo);
+                self.prev_hi = Some(r.current_hi);
+                Some(WindowTokens {
+                    breaks: r.breaks,
+                    word_like: r.word_like,
+                    ascii_upper: r.ascii_upper,
+                })
+            }
+            None => {
+                self.prev_lo = None;
+                self.prev_hi = None;
+                None
+            }
+        }
     }
 }
 

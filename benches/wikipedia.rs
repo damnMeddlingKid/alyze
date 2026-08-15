@@ -76,6 +76,31 @@ pub fn wikipedia_benchmark(c: &mut Criterion) {
     // comparable until that is wired up. The plain "word break" row is a fair comparison.
     word_break_benches!(group, &texts, "windowed", uax29::word::tokenize_windowed);
 
+    // Breakpoints only: the NEON kernel doesn't populate `TokenProperties`, so there's no
+    // "+ word_like" counterpart to run.
+    #[cfg(target_arch = "aarch64")]
+    group.bench_function(BenchmarkId::new("word break", "windowed neon"), |b| {
+        b.iter(|| {
+            let mut count = 0;
+            let mut word_like = 0;
+            for text in &texts {
+                uax29::word::tokenize_windowed_with::<uax29::word::Neon, _>(
+                    text,
+                    uax29::word::Options::default(),
+                    |_, props| {
+                        count += 1;
+                        if props.is_word_like() {      // plus the props check
+                            word_like += 1;
+                        }
+                        true
+                    },
+                );
+            }
+            std::hint::black_box(&count);
+            std::hint::black_box(&word_like);
+        })
+    });
+
     group.bench_function("sentence break", |b| {
         b.iter(|| {
             let mut count = 0;
