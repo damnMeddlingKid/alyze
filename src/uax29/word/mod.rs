@@ -14,8 +14,6 @@ use transitions::{State, TABLE, Transition};
 #[non_exhaustive]
 pub struct Options {}
 
-const WINDOW: usize = 16;
-
 /// For a given span, extracts info from the DFA state to provide useful information upstream, e.g.
 /// whether the span was "word-like", ascii, etc
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq)]
@@ -138,57 +136,17 @@ pub fn ascii_is_break(
 }
 
 pub struct WindowTokens {
-    pub breaks: u16,
-    pub word_like: u16,
-    pub ascii_upper: u16,
+    pub breaks: u32,
+    pub word_like: u32,
+    pub ascii_upper: u32,
 }
 
 pub struct NeonWindowTokens {
-    pub breaks: u16,
-    pub word_like: u16,
-    pub ascii_upper: u16,
+    pub breaks: u32,
+    pub word_like: u32,
+    pub ascii_upper: u32,
     pub current_lo: uint8x16_t,
     pub current_hi: uint8x16_t,
-}
-
-#[inline(always)]
-pub fn neonmovemask_bulk(p0: uint8x16_t, p1: uint8x16_t, p2: uint8x16_t, p3: uint8x16_t) -> u64 {
-    unsafe {
-        let bitmask1: uint8x16_t = vld1q_u8(
-            [
-                0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10, 0x01, 0x10,
-                0x01, 0x10,
-            ]
-            .as_ptr(),
-        );
-        let bitmask2: uint8x16_t = vld1q_u8(
-            [
-                0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20, 0x02, 0x20,
-                0x02, 0x20,
-            ]
-            .as_ptr(),
-        );
-        let bitmask3: uint8x16_t = vld1q_u8(
-            [
-                0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40, 0x04, 0x40,
-                0x04, 0x40,
-            ]
-            .as_ptr(),
-        );
-        let bitmask4: uint8x16_t = vld1q_u8(
-            [
-                0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80,
-                0x08, 0x80,
-            ]
-            .as_ptr(),
-        );
-        let t0: uint8x16_t = vandq_u8(p0, bitmask1);
-        let t1: uint8x16_t = vbslq_u8(bitmask2, p1, t0);
-        let t2: uint8x16_t = vbslq_u8(bitmask3, p2, t1);
-        let tmp: uint8x16_t = vbslq_u8(bitmask4, p3, t2);
-        let sum: uint8x16_t = vpaddq_u8(tmp, tmp);
-        vgetq_lane_u64(vreinterpretq_u64_u8(sum), 0)
-    }
 }
 
 #[inline(always)]
@@ -200,9 +158,173 @@ pub fn table_lookup(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> (u
         let current = vorrq_u8(top_tokens, bottom_tokens);
         let even_tokens = vuzp1q_u8(current, current);
         let odd_tokens = vuzp2q_u8(current, current);
-        let lo = vsliq_n_u8::<4>(odd_tokens, even_tokens);
-        let hi = vsriq_n_u8::<4>(even_tokens, odd_tokens);
+        let lo = vsliq_n_u8::<4>(even_tokens, odd_tokens);
+        let hi = vsriq_n_u8::<4>(odd_tokens, even_tokens);
         (lo, hi)
+    }
+}
+
+#[inline(always)]
+pub fn table_lookup32(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> uint8x16_t {
+    unsafe {
+        let input: uint8x16_t = vld1q_u8(bytes.as_ptr());
+        let top_tokens = vqtbl4q_u8(top, input);
+        let bottom_tokens = vqtbl4q_u8(bottom, vsubq_u8(input, vdupq_n_u8(64)));
+        vorrq_u8(top_tokens, bottom_tokens)
+    }
+}
+
+#[inline(always)]
+pub fn load_byte_info(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> (uint8x16_t, uint8x16_t) {
+    unsafe {
+        let first = table_lookup32(top, bottom, &bytes[0..16]);
+        let second = table_lookup32(top, bottom, &bytes[16..32]);
+        
+        let first_even_tokens = vuzp1q_u8(first, first);
+        let first_odd_tokens = vuzp2q_u8(first, first);
+        let first_lo = vsliq_n_u8::<4>(first_even_tokens, first_odd_tokens);
+        let first_hi = vsriq_n_u8::<4>(first_odd_tokens, first_even_tokens);
+
+        let second_even_tokens = vuzp1q_u8(second, second);
+        let second_odd_tokens = vuzp2q_u8(second, second);
+        let second_lo = vsliq_n_u8::<4>(second_even_tokens, second_odd_tokens);
+        let second_hi = vsriq_n_u8::<4>(second_odd_tokens, second_even_tokens);
+
+        let shifted_first_lo = vextq_u8::<8>(vdupq_n_u8(0), first_lo);
+        let lo = vextq_u8::<8>(shifted_first_lo, second_lo);
+
+        let shifted_first_hi = vextq_u8::<8>(vdupq_n_u8(0), first_hi);
+        let hi = vextq_u8::<8>(shifted_first_hi, second_hi);
+        
+        (lo, hi)
+    }
+}
+
+pub unsafe fn move_nibble_mask(input: uint8x16_t) -> u32 {
+    let mut mask = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(input));
+    mask = (mask | (mask >> 3)) & 0x0303030303030303;
+    mask = (mask | (mask >> 6)) & 0x000F000F000F000F;
+    mask = (mask | (mask >> 12)) & 0x00FF00FF00FF00FF;
+    mask = (mask >> 24) | mask;
+    let lo_mask = mask & 0xFFFF;
+
+    mask = vgetq_lane_u64::<1>(vreinterpretq_u64_u8(input));
+    mask = (mask | (mask >> 3)) & 0x0303030303030303;
+    mask = (mask | (mask >> 6)) & 0x000F000F000F000F;
+    mask = (mask | (mask >> 12)) & 0x00FF00FF00FF00FF;
+    mask = (mask >> 24) | mask;
+    let hi_mask = mask & 0xFFFF;
+    ((hi_mask << 16) | lo_mask) as u32
+}
+
+#[inline(always)]
+pub fn maybe_process_ascii_window_neon32(
+    bytes: &[u8],
+    pos: usize,
+    top: uint8x16x4_t,
+    bottom: uint8x16x4_t
+) -> Option<WindowTokens> {
+    let mut high_bit_acc: u8 = 0;
+    for i in 0..32 {
+        let b = bytes[pos - 2 + i];
+        high_bit_acc |= b;
+    }
+
+    if high_bit_acc & 0x80 != 0 {
+        return None;
+    }
+
+    #[inline(always)]
+    unsafe fn shl_nibble(v: uint8x16_t) -> uint8x16_t {
+        let nxt = vextq_u8::<15>(vdupq_n_u8(0), v);
+        vsriq_n_u8::<4>(vshlq_n_u8::<4>(v), nxt)
+    }
+
+    #[inline(always)]
+    unsafe fn shr_nibble(v: uint8x16_t) -> uint8x16_t {
+        let prv = vextq_u8::<1>(v, vdupq_n_u8(0));
+        vsliq_n_u8::<4>(vshrq_n_u8::<4>(v), prv)
+    }
+
+    unsafe {
+        let (full_lo, full_hi) = load_byte_info(top, bottom, &bytes[pos-2..(pos -2 + 32)]);
+
+        // let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
+        let wb6 = vandq_u8(
+            shr_nibble(full_lo),
+            vandq_u8(vshrq_n_u8(full_lo, 3), shl_nibble(full_lo)),
+        );
+
+        // let wb6wb7 = wb6 | (wb6 << 1);
+        let wb6wb7 = vorrq_u8(wb6, shl_nibble(wb6));
+
+        // let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
+        let wb12 = vandq_u8(
+            shr_nibble(full_hi),
+            vandq_u8(vshrq_n_u8(full_lo, 1), shl_nibble(full_hi)),
+        );
+
+        // let wb11wb12 = wb12 | (wb12 << 1);
+        let wb11wb12 = vorrq_u8(wb12, shl_nibble(wb12));
+
+        /*
+        let wbex1 = is_extend & (is_extend << 1);
+        let wbwseg = is_wseg & (is_wseg << 1);
+        let wbcrlf = is_lf & (is_cr << 1);
+         */
+        let wbex1 = vshrq_n_u8(vandq_u8(full_lo, shl_nibble(full_lo)), 2);
+        let wbwseg = vshrq_n_u8(vandq_u8(full_hi, shl_nibble(full_hi)), 3);
+        let wbcrlf = vandq_u8(vshrq_n_u8(full_hi, 2), vshrq_n_u8(shl_nibble(full_hi), 1));
+
+        let a = vorrq_u8(wb6wb7, wb11wb12);
+        let b = vorrq_u8(wbex1, wbwseg);
+        let do_not_break = vorrq_u8(vorrq_u8(a, b), wbcrlf);
+        
+        let mut breaks = vandq_u8(vmvnq_u8(do_not_break), vdupq_n_u8(0x11));
+        // we need to shift off the prev1 and prev2 bits
+        breaks = vextq_u8::<1>(breaks, vdupq_n_u8(0));
+
+        let mut breaks_mask = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(breaks));
+        breaks_mask = (breaks_mask | (breaks_mask >> 3)) & 0x0303030303030303;
+        breaks_mask = (breaks_mask | (breaks_mask >> 6)) & 0x000F000F000F000F;
+        breaks_mask = (breaks_mask | (breaks_mask >> 12)) & 0x00FF00FF00FF00FF;
+        breaks_mask = (breaks_mask >> 24) | breaks_mask;
+        let lo_mask = breaks_mask & 0xFFFF;
+
+        breaks_mask = vgetq_lane_u64::<1>(vreinterpretq_u64_u8(breaks));
+        breaks_mask = (breaks_mask | (breaks_mask >> 3)) & 0x0303030303030303;
+        breaks_mask = (breaks_mask | (breaks_mask >> 6)) & 0x000F000F000F000F;
+        breaks_mask = (breaks_mask | (breaks_mask >> 12)) & 0x00FF00FF00FF00FF;
+        breaks_mask = (breaks_mask >> 24) | breaks_mask;
+        let hi_mask = breaks_mask & 0xFFFF;
+        let full_mask = (hi_mask << 16) | lo_mask ;
+
+        let mut word_like_vector = vorrq_u8(full_hi, full_lo);
+        word_like_vector = vandq_u8(word_like_vector, vdupq_n_u8(0x11));
+        // remove 1 byte of previous
+        word_like_vector = vextq_u8::<1>(word_like_vector, vdupq_n_u8(0));
+        let word_like = move_nibble_mask(word_like_vector);
+
+        let window_bytes = &bytes[pos-2..(pos -2 + 32)];
+        let first = vld1q_u8(window_bytes.as_ptr());
+        let second = vld1q_u8(window_bytes.as_ptr().add(16));
+        let mut is_first_upper = vcleq_u8(vsubq_u8(first, vdupq_n_u8(b'A')), vdupq_n_u8(b'Z' - b'A'));
+        is_first_upper = vandq_u8(is_first_upper, vdupq_n_u8(0x01));
+        is_first_upper = vorrq_u8(is_first_upper, vshlq_n_u8::<4>(vextq_u8::<1>(is_first_upper, vdupq_n_u8(0))));
+        is_first_upper = vextq_u8::<2>(is_first_upper, vdupq_n_u8(0));
+        
+        let mut is_second_upper = vcleq_u8(vsubq_u8(second, vdupq_n_u8(b'A')), vdupq_n_u8(b'Z' - b'A'));
+        is_second_upper = vandq_u8(is_second_upper, vdupq_n_u8(0x01));
+        is_second_upper = vorrq_u8(is_second_upper, vshlq_n_u8::<4>(vextq_u8::<1>(is_second_upper, vdupq_n_u8(0))));
+
+        let full_upper = vorrq_u8(is_first_upper, vextq_u8::<8>(vdupq_n_u8(0), is_second_upper));
+        let ascii_upper = move_nibble_mask(full_upper);
+        
+        Some(WindowTokens {
+            breaks: (full_mask  & 0x1FFFFFFF) as u32,
+            word_like: (word_like & 0x1FFFFFFF),
+            ascii_upper: (ascii_upper & 0x1FFFFFFF),
+        })
     }
 }
 
@@ -219,7 +341,7 @@ pub fn maybe_process_ascii_window_neon(
     let mut ascii_upper: u32 = 0;
 
     let mut high_bit_acc: u8 = 0;
-    for i in 0..(WINDOW + 2 + 1) {
+    for i in 0..(Neon::WINDOW_SIZE + 2 + 1) {
         let b = bytes[pos - 2 + i];
         high_bit_acc |= b;
     }
@@ -230,52 +352,27 @@ pub fn maybe_process_ascii_window_neon(
 
     #[inline(always)]
     unsafe fn shl_nibble(v: uint8x16_t) -> uint8x16_t {
-        let nxt = vextq_u8::<1>(v, vdupq_n_u8(0));
+        let nxt = vextq_u8::<15>(vdupq_n_u8(0), v);
         vsriq_n_u8::<4>(vshlq_n_u8::<4>(v), nxt)
     }
 
     #[inline(always)]
     unsafe fn shr_nibble(v: uint8x16_t) -> uint8x16_t {
-        let prv = vextq_u8::<15>(vdupq_n_u8(0), v);
+        let prv = vextq_u8::<1>(v, vdupq_n_u8(0));
         vsliq_n_u8::<4>(vshrq_n_u8::<4>(v), prv)
     }
 
     unsafe {
-        // let input: uint8x16_t = vld1q_u8(bytes.as_ptr().add(pos));
-        // let top_tokens = vqtbl4q_u8(top, input);
-        // let bottom_tokens = vqtbl4q_u8(bottom, vsubq_u8(input, vdupq_n_u8(64)));
-        // let current = vorrq_u8(top_tokens, bottom_tokens);
-        // let even_tokens = vuzp1q_u8(current, current);
-        // let odd_tokens = vuzp2q_u8(current, current);
-        // let current_lo = vsliq_n_u8::<4>(odd_tokens, even_tokens);
-        // let current_hi = vsriq_n_u8::<4>(even_tokens, odd_tokens);
-        // TODO: lets accept a  &[u8; WINDOW]) in the functiono args
         let (current_lo, current_hi) = table_lookup(top, bottom, &bytes[pos..pos + 16]);
 
         let previous2_lo = vextq_u8::<15>(previous_lo, current_lo);
         let previous2_hi = vextq_u8::<15>(previous_hi, current_hi);
 
-        let next_token = ASCII_CUSTOM_BYTE[bytes[pos + WINDOW] as usize];
+        let next_token = ASCII_CUSTOM_BYTE[bytes[pos + Neon::WINDOW_SIZE] as usize];
 
-        let full_lo = vsetq_lane_u8::<9>(next_token << 4, previous2_lo);
-        let full_hi = vsetq_lane_u8::<9>(next_token, previous2_hi);
-
-        // let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
-        // let wb6wb7 = wb6 | (wb6 << 1);
-        // let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
-        // let wb11wb12 = wb12 | (wb12 << 1);
-
-        /*
-        letter
-            | (mid_num << 1)
-            | (extend << 2)
-            | (mid_let << 3)
-            | (numeric << 4)
-            | (cr << 5)
-            | (lf << 6)
-            | (wseg << 7)
-         */
-
+        let full_lo = vsetq_lane_u8::<9>(next_token, previous2_lo);
+        let full_hi = vsetq_lane_u8::<9>(next_token >> 4, previous2_hi);
+        
         // let wb6 = (is_letter << 1) & is_mid_let & (is_letter >> 1);
         let wb6 = vandq_u8(
             shr_nibble(full_lo),
@@ -283,7 +380,7 @@ pub fn maybe_process_ascii_window_neon(
         );
 
         // let wb6wb7 = wb6 | (wb6 << 1);
-        let wb6wb7 = vorrq_u8(wb6, shr_nibble(wb6));
+        let wb6wb7 = vorrq_u8(wb6, shl_nibble(wb6));
 
         // let wb12 = (is_numeric << 1) & is_mid_num & (is_numeric >> 1);
         let wb12 = vandq_u8(
@@ -292,20 +389,16 @@ pub fn maybe_process_ascii_window_neon(
         );
 
         // let wb11wb12 = wb12 | (wb12 << 1);
-        let wb11wb12 = vorrq_u8(wb12, shr_nibble(wb12));
+        let wb11wb12 = vorrq_u8(wb12, shl_nibble(wb12));
 
         /*
         let wbex1 = is_extend & (is_extend << 1);
         let wbwseg = is_wseg & (is_wseg << 1);
         let wbcrlf = is_lf & (is_cr << 1);
-        | (numeric << 4)
-        | (cr << 5)
-        | (lf << 6)
-        | (wseg << 7)
          */
-        let wbex1 = vshrq_n_u8(vandq_u8(full_lo, shr_nibble(full_lo)), 2);
-        let wbwseg = vshrq_n_u8(vandq_u8(full_hi, shr_nibble(full_hi)), 3);
-        let wbcrlf = vandq_u8(vshrq_n_u8(full_hi, 2), vshrq_n_u8(shr_nibble(full_hi), 1));
+        let wbex1 = vshrq_n_u8(vandq_u8(full_lo, shl_nibble(full_lo)), 2);
+        let wbwseg = vshrq_n_u8(vandq_u8(full_hi, shl_nibble(full_hi)), 3);
+        let wbcrlf = vandq_u8(vshrq_n_u8(full_hi, 2), vshrq_n_u8(shl_nibble(full_hi), 1));
 
         let a = vorrq_u8(wb6wb7, wb11wb12);
         let b = vorrq_u8(wbex1, wbwseg);
@@ -320,11 +413,12 @@ pub fn maybe_process_ascii_window_neon(
         breaks_mask = (breaks_mask | (breaks_mask >> 6)) & 0x000F000F000F000F;
         breaks_mask = (breaks_mask | (breaks_mask >> 12)) & 0x00FF00FF00FF00FF;
         breaks_mask = (breaks_mask >> 24) | breaks_mask;
+        breaks_mask = breaks_mask & 0xFFFF;
 
         Some(NeonWindowTokens {
-            breaks: breaks_mask as u16,
-            word_like: (word_like >> 2) as u16,
-            ascii_upper: (ascii_upper >> 2) as u16,
+            breaks: breaks_mask as u32,
+            word_like: (word_like >> 2) as u32,
+            ascii_upper: (ascii_upper >> 2) as u32,
             current_lo: current_lo,
             current_hi: current_hi,
         })
@@ -345,7 +439,7 @@ pub fn maybe_process_ascii_window(bytes: &[u8], pos: usize) -> Option<WindowToke
     let mut is_wseg: u32 = 0;
 
     let mut high_bit_acc: u8 = 0;
-    for i in 0..(WINDOW + 2 + 1) {
+    for i in 0..(16 + 2 + 1) {
         let b = bytes[pos - 2 + i];
         high_bit_acc |= b;
     }
@@ -356,7 +450,7 @@ pub fn maybe_process_ascii_window(bytes: &[u8], pos: usize) -> Option<WindowToke
 
     let mask = 1;
 
-    for i in 0..(WINDOW + 2 + 1) {
+    for i in 0..(16 + 2 + 1) {
         let idx = ASCII_CUSTOM[bytes[pos - 2 + i] as usize] as u32;
         is_mid_let |= (idx & (mask)) << i;
         is_mid_num |= (idx & (mask << 1)) >> 1 << i;
@@ -407,12 +501,12 @@ pub fn maybe_process_ascii_window(bytes: &[u8], pos: usize) -> Option<WindowToke
     let wbwseg = is_wseg & (is_wseg << 1);
 
     let do_not_break = wb6wb7 | wb11wb12 | wbex1 | wbcrlf | wbwseg;
-    let breaks = !(do_not_break >> 2) as u16;
+    let breaks = !(do_not_break >> 2) as u32;
 
     Some(WindowTokens {
         breaks: breaks,
-        word_like: (word_like >> 2) as u16,
-        ascii_upper: (ascii_upper >> 2) as u16,
+        word_like: (word_like >> 2) as u32,
+        ascii_upper: (ascii_upper >> 2) as u32,
     })
 }
 
@@ -422,7 +516,7 @@ pub fn tokenize_windowed(
     on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
 ) {
     #[cfg(target_arch = "aarch64")]
-    tokenize_windowed_with::<Neon, _>(text, options, on_breakpoint);
+    tokenize_windowed_with::<Neon32, _>(text, options, on_breakpoint);
     #[cfg(not(target_arch = "aarch64"))]
     tokenize_windowed_with::<Scalar, _>(text, options, on_breakpoint);
 }
@@ -451,20 +545,22 @@ pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenPropertie
         // We only accept all ascii windows
         // We dont handoff state from the scalar parsing to the window
         if pos >= P::MIN_POS
-            && pos + WINDOW + 3 < bytes.len()
+            && pos + P::WINDOW_SIZE + 3 < bytes.len()
             && deferred_break_pos.is_none()
             && last_was_zwj == false
             && bytes[pos - 1] < 0x80
             && bytes[pos - 2] < 0x80
         {
-            while pos + WINDOW + 3 < bytes.len() {
+            let mut processed_window = false;
+            let mut last_break = 0;
+            while pos + P::WINDOW_SIZE + 3 < bytes.len() {
                 if let Some(res) = processor.process(bytes, pos) {
                     let mut breaks = res.breaks;
 
                     let mut start = 0;
                     while breaks != 0 {
                         let next_break = breaks.trailing_zeros();
-                        let prop_mask: u16 = (1u16 << next_break) - (1u16 << start);
+                        let prop_mask: u32 = (1u32 << next_break) - (1u32 << start);
 
                         token_props.0 |= ((res.word_like & prop_mask != 0) as u8).wrapping_neg()
                             & TokenProperties::WORD_LIKE_MASK;
@@ -480,6 +576,7 @@ pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenPropertie
 
                         start = next_break;
                         breaks &= breaks - 1;
+                        last_break = pos + next_break as usize;
                     }
 
                     // handoff to the next window, we will need to handoff tokenprops
@@ -487,15 +584,31 @@ pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenPropertie
 
                     // handoof token props to continue into the next window
                     // we already zero'd out other tokens so theres no mask required
-                    let prop_mask: u16 = ((1u32 << 16) - (1u32 << start)) as u16;
+                    let prop_mask: u32 = ((1u32 << 29) - (1u32 << start)) as u32;
                     token_props.0 = ((res.word_like & prop_mask != 0) as u8).wrapping_neg()
                         & TokenProperties::WORD_LIKE_MASK;
                     token_props.0 |= ((res.ascii_upper & prop_mask != 0) as u8).wrapping_neg()
                         & TokenProperties::HAS_ASCII_UPPER_MASK;
 
-                    pos += WINDOW;
+                    pos += P::WINDOW_SIZE;
+                    processed_window = true;
                 } else {
                     break;
+                }
+            }
+
+            if processed_window {
+                let previous_state = TABLE[State::Any as usize][ASCII_WORD_BREAK_PROP[bytes[pos-2] as usize] as usize].0;
+                state = TABLE[previous_state as usize][ASCII_WORD_BREAK_PROP[bytes[pos-1] as usize] as usize].0;
+                let next_state = TABLE[state as usize][ASCII_WORD_BREAK_PROP[bytes[pos] as usize] as usize].0;
+                if state.is_deferred() {
+                    if last_break != pos-1 {
+                        deferred_break_pos = Some(pos-1);
+                        deferred_props.0 = ASCII_BYTE_INFO[bytes[pos-1] as usize] & !ASCII_WORD_CONTINUE;
+                    } else {
+                        //We have already consumed this deferred break, advance to the next state.
+                        state = next_state;
+                    }
                 }
             }
         }
@@ -638,6 +751,81 @@ pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenPropertie
 /// A tokenizer that implements UAX #29 word boundary rules, using a deterministic finite automaton
 /// (DFA) to efficiently determine word boundaries in Unicode text. Includes a number of fast-paths
 /// for common cases, e.g. ASCII.
+/// A tokenizer for pure-ASCII input that never runs the DFA.
+///
+/// Instead of a per-character state machine it evaluates the break rules directly as boolean
+/// predicates over a four-character sliding window of `ASCII_CUSTOM_BYTE` class bytes, and emits
+/// breakpoints and token properties itself. Same rule set as the window kernels, one character at
+/// a time rather than sixteen or twenty-nine.
+///
+/// The point is to remove the DFA's loop-carried dependency: `TABLE[state][prop]` is a dependent
+/// load whose result feeds the next iteration's index, which serializes the loop. The predicate
+/// form has no such chain — every position's decision depends only on the four class bytes around
+/// it, so the work pipelines.
+///
+/// Falls back to [`tokenize`] if the input is not entirely ASCII.
+pub fn tokenize_ascii(
+    text: &str,
+    options: Options,
+    mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if !text.is_ascii() {
+        return tokenize(text, options, on_breakpoint);
+    }
+
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+
+    // Class byte for a position, zero past the ends. Bits, from `ASCII_CUSTOM_BYTE`:
+    //   0 letter  1 mid_num  2 extend  3 mid_let  4 numeric  5 cr  6 lf  7 wseg
+    let tok = |j: usize| -> u8 { ASCII_CUSTOM_BYTE[bytes[j] as usize] };
+    let char_props =
+        |j: usize| -> u8 { ASCII_BYTE_INFO[bytes[j] as usize] & !ASCII_WORD_CONTINUE };
+
+    // WB1: sot divides, with no token before it.
+    let mut props = TokenProperties::default();
+    if !on_breakpoint(0, std::mem::take(&mut props)) {
+        return;
+    }
+    props.0 |= char_props(0);
+
+    // Sliding window of class bytes: t2 = i-2, t1 = i-1, t0 = i, tn = i+1, starting at i = 1.
+    let mut t2: u8 = 0;
+    let mut t1: u8 = tok(0);
+    let mut t0: u8 = if n > 1 { tok(1) } else { 0 };
+    let mut tn: u8 = if n > 2 { tok(2) } else { 0 };
+
+    for i in 1..n {
+        // Each term is the rule from `maybe_process_ascii_window`, with the class bit shifted
+        // down to bit 0. Everything above bit 0 is masked off at the end.
+        let wb6 = t1 & tn & (t0 >> 3); // letter(i-1) & mid_let(i)  & letter(i+1)
+        let wb7 = t2 & t0 & (t1 >> 3); // letter(i-2) & mid_let(i-1) & letter(i)
+        let wb12 = (t1 >> 4) & (tn >> 4) & (t0 >> 1); // numeric x mid_num x numeric
+        let wb11 = (t2 >> 4) & (t0 >> 4) & (t1 >> 1);
+        let ext = (t0 >> 2) & (t1 >> 2); // ALetter|Numeric|ExtendNumLet on both sides
+        let crlf = (t0 >> 6) & (t1 >> 5); // cr(i-1) & lf(i)
+        let wseg = (t0 >> 7) & (t1 >> 7); // WSegSpace x WSegSpace
+
+        let do_not_break = (wb6 | wb7 | wb12 | wb11 | ext | crlf | wseg) & 1;
+
+        if do_not_break == 0 && !on_breakpoint(i, std::mem::take(&mut props)) {
+            return;
+        }
+        props.0 |= char_props(i);
+
+        t2 = t1;
+        t1 = t0;
+        t0 = tn;
+        tn = if i + 2 < n { tok(i + 2) } else { 0 };
+    }
+
+    // WB2: Any divides eot.
+    _ = on_breakpoint(n, props);
+}
+
 pub fn tokenize(
     text: &str,
     _options: Options,
@@ -925,6 +1113,33 @@ const ASCII_CUSTOM: [u16; 128] = {
     t
 };
 
+static ASCII_TO_STATE: [State; 128] = {
+    let mut t = [State::Any; 128];
+    let mut i = 0u8;
+    loop {
+        t[i as usize] = {
+            let byte_info = ASCII_CUSTOM_BYTE[i as usize];
+            match byte_info {
+                1 => State::ALetter,
+                2 => State::NumericMid,
+                4 => State::ExtendNumLet,
+                8 => State::AHLetterMid,
+                16 => State::Numeric,
+                32 => State::CR,
+                // no state for lf
+                128 => State::WSegSpace,
+                _ => State::ALetter
+            }
+        };
+
+        if i == 127 {
+            break;
+        }
+        i += 1;
+    }
+    t
+};
+
 static ASCII_CUSTOM_BYTE: [u8; 128] = {
     let mut t = [0u8; 128];
     let mut i = 0u8;
@@ -1007,6 +1222,7 @@ pub trait WindowProcessor: Copy {
     /// Bytes of left context `process` reads before `pos`; the caller must not call `process`
     /// with a smaller `pos`.
     const MIN_POS: usize;
+    const WINDOW_SIZE: usize;
 
     fn new() -> Self;
     fn process(&mut self, bytes: &[u8], pos: usize) -> Option<WindowTokens>;
@@ -1017,6 +1233,7 @@ pub struct Scalar;
 
 impl WindowProcessor for Scalar {
     const MIN_POS: usize = 2;
+    const WINDOW_SIZE: usize = 16;
 
     #[inline(always)]
     fn new() -> Self {
@@ -1040,9 +1257,41 @@ pub struct Neon {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct Neon32 {
+    top: uint8x16x4_t,
+    bottom: uint8x16x4_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl WindowProcessor for Neon32 {
+    // `process` table-looks-up the preceding window to seed prev_lo/prev_hi.
+    const MIN_POS: usize = 2;
+    const WINDOW_SIZE: usize = 29;
+
+    #[inline(always)]
+    fn new() -> Self {
+        // SAFETY: table is 128 bytes; NEON is baseline on aarch64.
+        unsafe {
+            let p = ASCII_CUSTOM_BYTE.as_ptr();
+            Neon32 {
+                top: vld1q_u8_x4(p),
+                bottom: vld1q_u8_x4(p.add(64))
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn process(&mut self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+        maybe_process_ascii_window_neon32(bytes, pos, self.top, self.bottom)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 impl WindowProcessor for Neon {
     // `process` table-looks-up the preceding window to seed prev_lo/prev_hi.
-    const MIN_POS: usize = WINDOW;
+    const MIN_POS: usize = 16;
+    const WINDOW_SIZE: usize = 16;
 
     #[inline(always)]
     fn new() -> Self {
@@ -1065,12 +1314,12 @@ impl WindowProcessor for Neon {
         // last one we processed; anything else (a scalar run in between, a rejected window) means
         // we have to re-derive it.
         let cached = match (self.prev_lo, self.prev_hi) {
-            (Some(lo), Some(hi)) if pos == self.prev_pos + WINDOW => Some((lo, hi)),
+            (Some(lo), Some(hi)) if pos == self.prev_pos + 16 => Some((lo, hi)),
             _ => None,
         };
         let (prev_lo, prev_hi) = match cached {
             Some(prev) => prev,
-            None => table_lookup(self.top, self.bottom, &bytes[pos - WINDOW..pos]),
+            None => table_lookup(self.top, self.bottom, &bytes[pos - 16..pos]),
         };
 
         match maybe_process_ascii_window_neon(bytes, pos, self.top, self.bottom, prev_lo, prev_hi) {
@@ -1105,28 +1354,25 @@ mod tests {
     /// The oracle is `tokenize`, the DFA the UAX #29 conformance tests run against. The scalar
     /// window kernel is deliberately *not* used here: it is a second transcription of the same
     /// rules, so any misreading the two share would cancel out and this would pass while both
-    /// were wrong.
+    /// were wrong. (It is also known to disagree with the DFA in ~2% of windows.)
     ///
     /// Every case is pure ASCII, and the window's two bytes of left context plus one byte of
     /// lookahead are exactly the context these rules need, so a correct window must agree with
     /// the DFA at every position it reports.
     #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_kernel_matches_dfa_rules() {
-        use super::WINDOW;
-        use crate::uax29::word::{Neon, WindowProcessor};
-
+    fn check_kernel_rules<P: crate::uax29::word::WindowProcessor>(
+        name: &str,
+        failures: &mut Vec<String>,
+    ) {
         const CASES: &[(&str, &str)] = &[
-            ("WB6/WB7   ALetter x MidLetter x ALetter", "can't stop o'neill won't go"),
-            ("WB6/WB7   MidNumLet between letters", "a.b.c d.e.f g.h.i j.k.l m.n"),
-            ("WB11/WB12 Numeric x MidNum x Numeric", "1,234 5.67 89,012 3.4 56,78"),
-            ("WB13a/b   ExtendNumLet adjacency", "foo_bar_baz a1b2c3 x_1 y_2 z_3"),
-            ("WB3       CR x LF", "a\r\nb c\r\nd e\r\nf g\r\nh i\r\nj k"),
-            ("WB3d      WSegSpace x WSegSpace", "a  b   c    d  e   f    g  h"),
-            ("mixed     rules meeting at the edge", "ab.cd 12,34 ef_gh  ij\r\nkl mn.op"),
+            ("WB6/WB7   ALetter x MidLetter x ALetter", "can't stop o'neill won't go now"),
+            ("WB6/WB7   MidNumLet between letters", "a.b.c d.e.f g.h.i j.k.l m.n o.p"),
+            ("WB11/WB12 Numeric x MidNum x Numeric", "1,234 5.67 89,012 3.4 56,78 9,01"),
+            ("WB13a/b   ExtendNumLet adjacency", "foo_bar_baz a1b2c3 x_1 y_2 z_3 w_4"),
+            ("WB3       CR x LF", "a\r\nb c\r\nd e\r\nf g\r\nh i\r\nj k\r\nl m"),
+            ("WB3d      WSegSpace x WSegSpace", "a  b   c    d  e   f    g  h   i  j"),
+            ("mixed     rules meeting at the edge", "ab.cd 12,34 ef_gh  ij\r\nkl mn.op qr,st"),
         ];
-
-        let mut failures = Vec::new();
 
         for (rule, body) in CASES {
             let text = format!("{body} {body} {body}");
@@ -1138,67 +1384,181 @@ mod tests {
                 true
             });
 
-            let mut processor = Neon::new();
-            let last = bytes.len().saturating_sub(WINDOW + 4);
-            for pos in Neon::MIN_POS..last {
+            let mut processor = P::new();
+            let last = bytes.len().saturating_sub(P::WINDOW_SIZE + 4);
+            for pos in P::MIN_POS.max(2)..last {
                 let Some(got) = processor.process(bytes, pos) else {
                     continue;
                 };
 
-                let mut want_mask = 0u16;
-                for j in 0..WINDOW {
+                let mut want = 0u32;
+                for j in 0..P::WINDOW_SIZE {
                     if is_break[pos + j] {
-                        want_mask |= 1 << j;
+                        want |= 1 << j;
                     }
                 }
-                if got.breaks == want_mask {
+                let got = got.breaks as u32;
+                if got == want {
                     continue;
                 }
 
-                let diff = got.breaks ^ want_mask;
-                let offsets: Vec<usize> = (0..WINDOW).filter(|j| (diff >> j) & 1 == 1).collect();
+                let diff = got ^ want;
+                let offsets: Vec<usize> =
+                    (0..P::WINDOW_SIZE).filter(|j| (diff >> j) & 1 == 1).collect();
                 let chars: String = offsets.iter().map(|j| bytes[pos + j] as char).collect();
                 failures.push(format!(
-                    "  {rule}\n    pos={pos} {:?}\n    dfa  {want_mask:016b}\n    neon {got:016b}\n    differs at window offsets {offsets:?} (chars {chars:?})",
-                    &text[pos..(pos + WINDOW).min(text.len())],
-                    got = got.breaks,
+                    "  [{name}] {rule}\n    pos={pos} {:?}\n    dfa  {want:032b}\n    got  {got:032b}\n    differs at offsets {offsets:?} (chars {chars:?})",
+                    &text[pos..(pos + P::WINDOW_SIZE).min(text.len())]
                 ));
-                // One report per rule is enough to work from.
+                // One report per rule per processor is enough to work from.
                 break;
             }
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_kernel_matches_dfa_rules() {
+        use crate::uax29::word::{Neon, Neon32};
+
+        let mut failures = Vec::new();
+        check_kernel_rules::<Neon>("Neon", &mut failures);
+        check_kernel_rules::<Neon32>("Neon32", &mut failures);
 
         assert!(
             failures.is_empty(),
-            "NEON window rules disagree with the DFA:\n{}",
+            "window rules disagree with the DFA:\n{}",
             failures.join("\n")
         );
     }
 
-    /// The window fast path advances `pos` without ever assigning `state`, so when the window
-    /// loop exits the DFA resumes with the state it held *before* the window ran.
+    /// `load_byte_info` packs 32 bytes of token info into two registers in *register order*:
+    /// position `p` occupies nibble `p` counting from the least significant nibble, so byte `i`
+    /// holds position `2i` in its low nibble and position `2i+1` in its high nibble. `lo` carries
+    /// the low nibble of each token (letter / mid_num / extend / mid_let) and `hi` the high one
+    /// (numeric / cr / lf / wseg).
     ///
-    /// Here the window starts at `pos = 2`, right after the `\r`, so the stale state is
-    /// `State::CR`. It covers bytes 2..18 and hands back at 18, which is the `n` of `brown` —
-    /// mid-token, where the true state is `ALetter`. `TABLE[CR][ALetter]` is a break, so a
-    /// breakpoint appears at 18 that the DFA never emits.
+    /// The input spans every class the table encodes, so both halves have live bits throughout:
     ///
-    /// Deliberately run through `Scalar`, whose kernel agrees with the DFA, so this fails only
-    /// for the handoff and not for anything in the NEON rules.
+    /// ```text
+    ///   a A 1 _ . , : ; ' CR LF SP b B 2 c 3 D 4 e 5 F 6 g 7 H 8 i 9 j K -
+    /// ```
+    ///
+    /// Expected vectors are literals rather than recomputed from `ASCII_CUSTOM_BYTE`, so the test
+    /// pins the packing against known-good output instead of restating the implementation.
+    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn window_handoff_leaves_dfa_state_stale() {
-        use crate::uax29::word::{Scalar, tokenize_windowed_with};
+    fn load_byte_info_packs_register_order() {
+        use super::{ASCII_CUSTOM_BYTE, load_byte_info};
+        use std::arch::aarch64::*;
 
-        // Each of these puts a window boundary inside a word, with a state before the window that
-        // disagrees with the state at the boundary.
-        const CASES: &[&str] = &[
-            "a\r\r the quick brown fox jumps over it",
-            "aa\r\r the quick brown fox jumps over it",
-            "a\r\n the quick brown fox jumps over it",
+        // a A 1 _ . , : ; ' CR LF SP b B 2 c 3 D 4 e 5 F 6 g 7 H 8 i 9 j K -
+        let input: &[u8; 32] = &[
+            0x61, 0x41, 0x31, 0x5F, 0x2E, 0x2C, 0x3A, 0x3B,
+            0x27, 0x0D, 0x0A, 0x20, 0x62, 0x42, 0x32, 0x63,
+            0x33, 0x44, 0x34, 0x65, 0x35, 0x46, 0x36, 0x67,
+            0x37, 0x48, 0x38, 0x69, 0x39, 0x6A, 0x4B, 0x2D,
+        ];
+
+        // `ASCII_CUSTOM_BYTE` for each input byte — the intermediate the packing consumes.
+        // bit 0 letter, 1 mid_num, 2 extend, 3 mid_let, 4 numeric, 5 cr, 6 lf, 7 wseg
+        const EXPECTED_TOKENS: [u8; 32] = [
+            0x05, 0x05, 0x14, 0x04, 0x0A, 0x02, 0x08, 0x02,
+            0x0A, 0x20, 0x40, 0x80, 0x05, 0x05, 0x14, 0x05,
+            0x14, 0x05, 0x14, 0x05, 0x14, 0x05, 0x14, 0x05,
+            0x14, 0x05, 0x14, 0x05, 0x14, 0x05, 0x05, 0x00,
+        ];
+
+        const EXPECTED_LO: [u8; 16] = [
+            0x55, 0x44, 0x2A, 0x28, 0x0A, 0x00, 0x55, 0x54,
+            0x54, 0x54, 0x54, 0x54, 0x54, 0x54, 0x54, 0x05,
+        ];
+
+        const EXPECTED_HI: [u8; 16] = [
+            0x00, 0x01, 0x00, 0x00, 0x20, 0x84, 0x00, 0x01,
+            0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
+        ];
+
+        // Pin the table first: if an entry moves, the packed expectations below are stale and
+        // this says so directly rather than surfacing as a confusing packing failure.
+        for i in 0..32 {
+            assert_eq!(
+                ASCII_CUSTOM_BYTE[input[i] as usize],
+                EXPECTED_TOKENS[i],
+                "ASCII_CUSTOM_BYTE[{:?}] changed; regenerate EXPECTED_LO / EXPECTED_HI",
+                input[i] as char
+            );
+        }
+
+        let (top, bottom) = unsafe {
+            let p = ASCII_CUSTOM_BYTE.as_ptr();
+            (vld1q_u8_x4(p), vld1q_u8_x4(p.add(64)))
+        };
+
+        let (lo, hi) = load_byte_info(top, bottom, input);
+        let (mut got_lo, mut got_hi) = ([0u8; 16], [0u8; 16]);
+        unsafe {
+            vst1q_u8(got_lo.as_mut_ptr(), lo);
+            vst1q_u8(got_hi.as_mut_ptr(), hi);
+        }
+
+        // Render each half as aligned rows so the two can be compared by eye, with carets
+        // under the lanes that differ.
+        let render = |name: &str, got: &[u8; 16], want: &[u8; 16]| -> String {
+            let cells = |v: &[u8; 16]| -> String {
+                v.iter().map(|b| format!("{b:#04X} ")).collect::<String>()
+            };
+            let index: String = (0..16).map(|i| format!("{i:>4} ")).collect();
+            let marks: String = (0..16)
+                .map(|i| if got[i] == want[i] { "     " } else { "  ^^ " })
+                .collect();
+            format!(
+                "  {name} lane {index}\n  {name}  got {}\n  {name} want {}\n  {name}      {marks}",
+                cells(got),
+                cells(want),
+            )
+        };
+
+        let wrong = (0..16)
+            .filter(|i| got_lo[*i] != EXPECTED_LO[*i] || got_hi[*i] != EXPECTED_HI[*i])
+            .count();
+
+        assert!(
+            got_lo == EXPECTED_LO && got_hi == EXPECTED_HI,
+            "load_byte_info: {wrong} of 16 lanes packed wrong\n{}\n{}",
+            render("lo", &got_lo, &EXPECTED_LO),
+            render("hi", &got_hi, &EXPECTED_HI),
+        );
+    }
+
+    /// Minimal input that panics the windowed tokenizer.
+    ///
+    /// The `.` is at offset 31, the last position of the only window, so the handoff hands the
+    /// DFA `AHLetterMid` plus a deferral at 31 — for a boundary the window has already resolved
+    /// and reported. The resume path then reaches `deferred_break_pos.take().unwrap()` in
+    /// `Action::DeferredBreak` with nothing pending.
+    ///
+    /// Pure ASCII: no window rejection is involved, so this is the handoff alone.
+    #[test]
+    fn windowed_does_not_panic_on_deferred_handoff() {
+        const CASES: &[(&str, &str)] = &[
+            // The `.` is at offset 31, the last position of the only window.
+            ("short", "aaaaaaaaaaathe Egyptian temples.\n\nMy"),
+            // From wikipedia doc 1123, shrunk to 1-minimal: no prefix, suffix, or interior
+            // deletion still reproduces it. The `.` of "Nachr.," is at offset 378, the last
+            // position of a window, with 5 bytes of text left after it.
+            (
+                "wikipedia doc 1123",
+                "a1), cemented objectives of thin lenses permit the elimination of spherical \
+                 aberration on the axis, if, as above, the collective lens has a smaller \
+                 refractive index; on the other hand, they permit the elimination of astigmatism \
+                 and curvature of the field, if the collective lens has a greater refractive \
+                 index (this follows from the Petzval equation; see L. Seidel, Astr.  Nachr., 18",
+            ),
         ];
 
         let mut failures = Vec::new();
-        for input in CASES {
+        for (name, input) in CASES {
             let mut want = Vec::new();
             tokenize(input, Options::default(), |bp, _| {
                 want.push(bp);
@@ -1206,24 +1566,93 @@ mod tests {
             });
 
             let mut got = Vec::new();
-            tokenize_windowed_with::<Scalar, _>(input, Options::default(), |bp, _| {
+            tokenize_windowed(input, Options::default(), |bp, _| {
                 got.push(bp);
                 true
             });
 
             if want != got {
-                let extra: Vec<usize> = got.iter().copied().filter(|b| !want.contains(b)).collect();
-                let missing: Vec<usize> =
-                    want.iter().copied().filter(|b| !got.contains(b)).collect();
+                let at = want
+                    .iter()
+                    .zip(got.iter())
+                    .position(|(w, g)| w != g)
+                    .unwrap_or(got.len().min(want.len()));
                 failures.push(format!(
-                    "  {input:?}\n    want {want:?}\n    got  {got:?}\n    extra {extra:?} missing {missing:?}"
+                    "  [{name}] len={} diverges at breakpoint {at}\n    want {:?}\n    got  {:?}",
+                    input.len(),
+                    &want[at.saturating_sub(2)..(at + 5).min(want.len())],
+                    &got[at.saturating_sub(2)..(at + 5).min(got.len())],
                 ));
             }
         }
 
         assert!(
             failures.is_empty(),
-            "windowed tokenizer disagrees with the DFA at window handoffs:\n{}",
+            "windowed tokenizer disagrees with the DFA:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Mid-class punctuation (`,` `.` `:` `'`) sitting next to non-ASCII, which makes a window
+    /// reject and hand back to the DFA while the deferred-break machinery is live.
+    ///
+    /// Found on the wikipedia corpus, not on the padded corpus: the window resolves the boundary
+    /// at the Mid character itself — it has the lookahead byte the DFA would have to defer for —
+    /// and the handoff then also hands the DFA a pending deferral for that same position, so the
+    /// breakpoint is reported twice. Every body is swept across 40 pad lengths so the Mid
+    /// character lands at every offset within a window.
+    #[test]
+    fn windowed_deferred_break_next_to_non_ascii() {
+        const BODIES: &[&str] = &[
+            "February 12, 1809\u{a0}\u{2013} April 15, 1865 and so on",
+            "the Egyptian temples.\n\nMythology \u{2013} Zosimos wrote it",
+            "British standard. The digits 0\u{2013}9 are printed here",
+            "a, b \u{2013} c, d \u{2013} e, f \u{2013} g, h \u{2013} i, j \u{2013} k, l",
+            "x.y \u{2013} z.w \u{2013} p.q \u{2013} r.s \u{2013} t.u \u{2013} v.w \u{2013} aa",
+            "it's \u{2013} a \u{2013} test's \u{2013} of \u{2013} quotes' \u{2013} and more",
+            "1,234 \u{a0}5,678 \u{a0}9,012 \u{a0}3,456 \u{a0}7,890 \u{a0}1,234",
+        ];
+
+        let mut failures = Vec::new();
+        for body in BODIES {
+            for pad in 0..40 {
+                let input = format!("{}{body}", "a".repeat(pad));
+
+                let mut want = Vec::new();
+                tokenize(&input, Options::default(), |bp, _| {
+                    want.push(bp);
+                    true
+                });
+
+                let mut got = Vec::new();
+                tokenize_windowed(&input, Options::default(), |bp, _| {
+                    got.push(bp);
+                    true
+                });
+
+                // Breakpoints must be strictly increasing. A repeat means one boundary was
+                // reported twice, which produces an empty token downstream.
+                if let Some(w) = got.windows(2).find(|w| w[1] <= w[0]) {
+                    if failures.len() < 10 {
+                        failures.push(format!(
+                            "  pad={pad} breakpoint {} repeated in {input:?}\n    got {got:?}",
+                            w[0]
+                        ));
+                    }
+                    continue;
+                }
+
+                if want != got && failures.len() < 10 {
+                    failures.push(format!(
+                        "  pad={pad} {input:?}\n    want {want:?}\n    got  {got:?}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "windowed tokenizer disagrees with the DFA around deferred breaks:\n{}",
             failures.join("\n")
         );
     }
@@ -1259,17 +1688,17 @@ mod tests {
     /// `TokenProperties` on the window path yet.
     #[test]
     fn windowed_matches_dfa_on_padded_corpus() {
-        use super::WINDOW;
         use crate::uax29::test_helpers::load_break_tests;
+        use crate::uax29::word::{Neon32, WindowProcessor};
 
         // Prefix lengths, chosen to land the body at every offset mod WINDOW and to straddle one,
         // two, and three window boundaries.
         const PADS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 31, 33];
         // Long enough on its own to satisfy `pos + WINDOW < len` after the body ends.
         const TAIL: &str = " the quick brown fox jumps over it";
-        const _: () = assert!(
-            TAIL.len() > WINDOW + 2,
-            "tail too short to reach the fast path"
+        assert!(
+            TAIL.len() > Neon32::WINDOW_SIZE + 2,
+            "tail too short to reach the fast path for the widest window"
         );
 
         let mut mismatches = Vec::new();
@@ -1324,6 +1753,18 @@ mod tests {
     fn windowed_matches_dfa_on_sampled_failures() {
         // (input, expected breakpoints, category)
         const CASES: &[(&str, &[usize], &str)] = &[
+            // Window handoff: a CR pair followed by a long ASCII run, so a window boundary lands
+            // inside a word. Padding shifts the body against the window grid.
+            (
+                "\r\r the quick brown fox jumps over it",
+                &[0, 1, 2, 3, 6, 7, 12, 13, 18, 19, 22, 23, 28, 29, 33, 34, 36],
+                "window handoff",
+            ),
+            (
+                "aa\r\r the quick brown fox jumps over it",
+                &[0, 2, 3, 4, 5, 8, 9, 14, 15, 20, 21, 24, 25, 30, 31, 35, 36, 38],
+                "window handoff",
+            ),
             // Extend directly after ASCII mid-punctuation.
             (".\u{0308}0", &[0, 3, 4], "extend after MidNumLet"),
             (",\u{0308}A", &[0, 3, 4], "extend after MidNum"),
@@ -1688,6 +2129,171 @@ mod tests {
     ///
     /// Expected values are written out rather than taken from `tokenize`, so a debugger session
     /// on this test has a fixed target that cannot move if the oracle changes.
+    /// The shortest case from `windowed_token_props_on_padded_ascii`: the same sentence as
+    /// `windowed_token_props_single_case` but long enough to span more than one window, which is
+    /// where the property bookkeeping and the window handoff meet.
+    /// The `HAS_ASCII_UPPER` half of the property bookkeeping, from the shortest failing case in
+    /// `windowed_token_props_on_padded_ascii`. The single uppercase `H` is at offset 2, so the
+    /// token carrying it closes at 7 and every later token is lowercase.
+    #[test]
+    fn windowed_token_props_ascii_upper_across_windows() {
+        use super::TokenProperties;
+
+        const INPUT: &str = "aaHello the quick brown fox jumps over it";
+        // (breakpoint, raw TokenProperties bits, the token that just closed), from the DFA.
+        // bit 0 = WORD_LIKE, bit 2 = HAS_ASCII_UPPER
+        const EXPECTED: &[(usize, u8, &str)] = &[
+            (0, 0b00000, ""),
+            (7, 0b00101, "aaHello"),
+            (8, 0b00000, " "),
+            (11, 0b00001, "the"),
+            (12, 0b00000, " "),
+            (17, 0b00001, "quick"),
+            (18, 0b00000, " "),
+            (23, 0b00001, "brown"),
+            (24, 0b00000, " "),
+            (27, 0b00001, "fox"),
+            (28, 0b00000, " "),
+            (33, 0b00001, "jumps"),
+            (34, 0b00000, " "),
+            (38, 0b00001, "over"),
+            (39, 0b00000, " "),
+            (41, 0b00001, "it"),
+        ];
+
+        let mut got: Vec<(usize, u8)> = Vec::new();
+        tokenize_windowed(INPUT, Options::default(), |bp, props: TokenProperties| {
+            got.push((bp, props.0));
+            true
+        });
+
+        let want: Vec<(usize, u8)> = EXPECTED.iter().map(|&(bp, p, _)| (bp, p)).collect();
+        if got != want {
+            let mut report = String::new();
+            for (i, &(bp, bits, tok)) in EXPECTED.iter().enumerate() {
+                let g = got.get(i);
+                let mark = if g == Some(&(bp, bits)) { "   " } else { "-> " };
+                report.push_str(&format!(
+                    "{mark}#{i} {tok:?}\n      want bp={bp} props={bits:#07b}\n       got {}\n",
+                    match g {
+                        Some((b, p)) => format!("bp={b} props={p:#07b}"),
+                        None => "<no emit>".to_string(),
+                    }
+                ));
+            }
+            panic!("{INPUT:?}\n{report}");
+        }
+    }
+
+    /// `tokenize_ascii` must agree with the DFA exactly on ASCII input — same breakpoints, same
+    /// property bits. Swept across pads so every rule lands at every offset.
+    #[test]
+    fn tokenize_ascii_matches_dfa() {
+        use super::{TokenProperties, tokenize_ascii};
+
+        const BODIES: &[&str] = &[
+            "hello the quick brown fox jumps over it",
+            "can't stop o'neill won't go now",
+            "a.b.c d.e.f g.h.i j.k.l m.n o.p",
+            "1,234 5.67 89,012 3.4 56,78 9,01",
+            "foo_bar_baz a1b2c3 x_1 y_2 z_3 w_4",
+            "a\r\nb c\r\nd e\r\nf g\r\nh i\r\nj k\r\nl m",
+            "a  b   c    d  e   f    g  h   i  j",
+            "the Quick brown Fox jumps over the lazy Dog again now",
+            "ABC def GHI jkl MNO pqr STU vwx YZa bcd EFG hij KLM no",
+            "...,,,;;;__   !!!???",
+            "x",
+            "",
+        ];
+
+        let mut failures = Vec::new();
+        for body in BODIES {
+            for pad in 0..40 {
+                let input = format!("{}{body}", "a".repeat(pad));
+
+                let mut want: Vec<(usize, u8)> = Vec::new();
+                tokenize(&input, Options::default(), |bp, p: TokenProperties| {
+                    want.push((bp, p.0));
+                    true
+                });
+
+                let mut got: Vec<(usize, u8)> = Vec::new();
+                tokenize_ascii(&input, Options::default(), |bp, p: TokenProperties| {
+                    got.push((bp, p.0));
+                    true
+                });
+
+                if want != got && failures.len() < 8 {
+                    let at = want
+                        .iter()
+                        .zip(got.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(want.len().min(got.len()));
+                    failures.push(format!(
+                        "  pad={pad} {input:?}\n    first differing emit #{at}\n    want {:?}\n    got  {:?}",
+                        &want[at.saturating_sub(1)..(at + 3).min(want.len())],
+                        &got[at.saturating_sub(1)..(at + 3).min(got.len())],
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "tokenize_ascii disagrees with the DFA:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn windowed_token_props_across_windows() {
+        use super::TokenProperties;
+
+        const INPUT: &str = "hello the quick brown fox jumps over it";
+        // (breakpoint, raw TokenProperties bits, the token that just closed), from the DFA.
+        const EXPECTED: &[(usize, u8, &str)] = &[
+            (0, 0b00000, ""),
+            (5, 0b00001, "hello"),
+            (6, 0b00000, " "),
+            (9, 0b00001, "the"),
+            (10, 0b00000, " "),
+            (15, 0b00001, "quick"),
+            (16, 0b00000, " "),
+            (21, 0b00001, "brown"),
+            (22, 0b00000, " "),
+            (25, 0b00001, "fox"),
+            (26, 0b00000, " "),
+            (31, 0b00001, "jumps"),
+            (32, 0b00000, " "),
+            (36, 0b00001, "over"),
+            (37, 0b00000, " "),
+            (39, 0b00001, "it"),
+        ];
+
+        let mut got: Vec<(usize, u8)> = Vec::new();
+        tokenize_windowed(INPUT, Options::default(), |bp, props: TokenProperties| {
+            got.push((bp, props.0));
+            true
+        });
+
+        let want: Vec<(usize, u8)> = EXPECTED.iter().map(|&(bp, p, _)| (bp, p)).collect();
+        if got != want {
+            let mut report = String::new();
+            for (i, &(bp, bits, tok)) in EXPECTED.iter().enumerate() {
+                let g = got.get(i);
+                let mark = if g == Some(&(bp, bits)) { "   " } else { "-> " };
+                report.push_str(&format!(
+                    "{mark}#{i} {tok:?}\n      want bp={bp} props={bits:#07b}\n       got {}\n",
+                    match g {
+                        Some((b, p)) => format!("bp={b} props={p:#07b}"),
+                        None => "<no emit>".to_string(),
+                    }
+                ));
+            }
+            panic!("{INPUT:?}\n{report}");
+        }
+    }
+
     #[test]
     fn windowed_token_props_single_case() {
         use super::TokenProperties;
@@ -1745,9 +2351,20 @@ mod tests {
     fn windowed_token_props_on_padded_ascii() {
         // Bodies from `tokenizer_word_like_ascii_sanity`, plus uppercase and boundary-straddling
         // cases so `has_ascii_upper` and the cross-window carry are exercised too.
+        //
+        // The multi-word uppercase bodies matter beyond the short ones: `has_ascii_upper` is
+        // accumulated per token with `(mask & prop_mask) != 0`, so a bit sitting at the wrong
+        // offset still gives the right answer while it stays inside the same token. Only a
+        // capital far enough into the window for the error to cross a token boundary shows it.
         const BODIES: &[&str] = &[
             "hello", "123", "abc123", "won't", "___", "   ", "!!!", "Hello", "aB", "HELLO",
             "a_b_c", "3.14", "e.g.", "x", "",
+            // capitals spread across several tokens, deep into the window
+            "the Quick brown Fox jumps over the lazy Dog again now",
+            "one Two three Four five Six seven Eight nine Ten more",
+            "a B c D e F g H i J k L m N o P q R s T u V w X y Z b",
+            "ABC def GHI jkl MNO pqr STU vwx YZa bcd EFG hij KLM no",
+            "hello WORLD hello WORLD hello WORLD hello WORLD hello",
         ];
         const PADS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 31, 33];
         const TAIL: &str = " the quick brown fox jumps over it";
