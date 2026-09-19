@@ -305,7 +305,7 @@ pub fn maybe_process_ascii_window_neon32(
         word_like_vector = vextq_u8::<1>(word_like_vector, vdupq_n_u8(0));
         let word_like = move_nibble_mask(word_like_vector);
 
-        let window_bytes = &bytes[pos-2..(pos -2 + 32)];
+        let window_bytes = &bytes[pos-2..(pos-2 + 32)];
         let first = vld1q_u8(window_bytes.as_ptr());
         let second = vld1q_u8(window_bytes.as_ptr().add(16));
         let mut is_first_upper = vcleq_u8(vsubq_u8(first, vdupq_n_u8(b'A')), vdupq_n_u8(b'Z' - b'A'));
@@ -2119,66 +2119,57 @@ mod tests {
         assert_word_like("!!!", vec![(0, false), (1, false), (2, false), (3, false)]);
     }
 
-    /// One reduced case from `windowed_token_props_on_padded_ascii`, hardcoded.
+    /// A single input from `windowed_token_props_on_padded_ascii`, reported emit by emit.
     ///
-    /// The shortest input that reproduces the property bug: 25 bytes, one window plus a tail.
-    /// Breakpoints are all correct — only the `WORD_LIKE` bit on the token `"brown"` is wrong,
-    /// and only that one, while the tokens before and after it are fine. `"brown"` is the token
-    /// that spans the handoff out of the first window, so this pins the carry at
-    /// `tokenize_windowed`'s `if last_break != 0` block rather than the per-token mask slicing.
-    ///
-    /// Expected values are written out rather than taken from `tokenize`, so a debugger session
-    /// on this test has a fixed target that cannot move if the oracle changes.
-    /// The shortest case from `windowed_token_props_on_padded_ascii`: the same sentence as
-    /// `windowed_token_props_single_case` but long enough to span more than one window, which is
-    /// where the property bookkeeping and the window handoff meet.
-    /// The `HAS_ASCII_UPPER` half of the property bookkeeping, from the shortest failing case in
-    /// `windowed_token_props_on_padded_ascii`. The single uppercase `H` is at offset 2, so the
-    /// token carrying it closes at 7 and every later token is lowercase.
+    /// The padded sweep only shows the first differing emit per input; this lists every differing
+    /// emit next to the token that closed there, so the pattern of which tokens gain or lose a
+    /// bit is visible. Expectations come from `tokenize`, so `INPUT` can be swapped for any case the
+    /// sweep reports.
     #[test]
     fn windowed_token_props_ascii_upper_across_windows() {
         use super::TokenProperties;
 
-        const INPUT: &str = "aaHello the quick brown fox jumps over it";
-        // (breakpoint, raw TokenProperties bits, the token that just closed), from the DFA.
-        // bit 0 = WORD_LIKE, bit 2 = HAS_ASCII_UPPER
-        const EXPECTED: &[(usize, u8, &str)] = &[
-            (0, 0b00000, ""),
-            (7, 0b00101, "aaHello"),
-            (8, 0b00000, " "),
-            (11, 0b00001, "the"),
-            (12, 0b00000, " "),
-            (17, 0b00001, "quick"),
-            (18, 0b00000, " "),
-            (23, 0b00001, "brown"),
-            (24, 0b00000, " "),
-            (27, 0b00001, "fox"),
-            (28, 0b00000, " "),
-            (33, 0b00001, "jumps"),
-            (34, 0b00000, " "),
-            (38, 0b00001, "over"),
-            (39, 0b00000, " "),
-            (41, 0b00001, "it"),
-        ];
+        const INPUT: &str =
+            "the Quick brown fox jumps over the l";
 
-        let mut got: Vec<(usize, u8)> = Vec::new();
-        tokenize_windowed(INPUT, Options::default(), |bp, props: TokenProperties| {
-            got.push((bp, props.0));
-            true
-        });
+        // (breakpoint, raw TokenProperties bits)
+        // bit 0 = WORD_LIKE, bit 1 = NON_ASCII, bit 2 = HAS_ASCII_UPPER
+        fn run(
+            tok: impl Fn(&str, Options, &mut dyn FnMut(usize, TokenProperties) -> bool),
+            s: &str,
+        ) -> Vec<(usize, u8)> {
+            let mut out = Vec::new();
+            tok(s, Options::default(), &mut |bp, props| {
+                out.push((bp, props.0));
+                true
+            });
+            out
+        }
 
-        let want: Vec<(usize, u8)> = EXPECTED.iter().map(|&(bp, p, _)| (bp, p)).collect();
-        if got != want {
+        let want = run(|s, o, cb| tokenize(s, o, cb), INPUT);
+        let got = run(|s, o, cb| tokenize_windowed(s, o, cb), INPUT);
+
+        if want != got {
+            let fmt = |e: Option<&(usize, u8)>| match e {
+                Some((bp, bits)) => format!("bp={bp} props={bits:#07b}"),
+                None => "<no emit>".to_string(),
+            };
             let mut report = String::new();
-            for (i, &(bp, bits, tok)) in EXPECTED.iter().enumerate() {
-                let g = got.get(i);
-                let mark = if g == Some(&(bp, bits)) { "   " } else { "-> " };
+            let mut prev = 0;
+            for i in 0..want.len().max(got.len()) {
+                let (w, g) = (want.get(i), got.get(i));
+                // The token that just closed, cut at the oracle's breakpoints.
+                let tok = match w {
+                    Some(&(bp, _)) => &INPUT[std::mem::replace(&mut prev, bp)..bp],
+                    None => "",
+                };
+                if w == g {
+                    continue;
+                }
                 report.push_str(&format!(
-                    "{mark}#{i} {tok:?}\n      want bp={bp} props={bits:#07b}\n       got {}\n",
-                    match g {
-                        Some((b, p)) => format!("bp={b} props={p:#07b}"),
-                        None => "<no emit>".to_string(),
-                    }
+                    "#{i} {tok:?}\n      want {}\n       got {}\n",
+                    fmt(w),
+                    fmt(g),
                 ));
             }
             panic!("{INPUT:?}\n{report}");
@@ -2359,7 +2350,14 @@ mod tests {
         const BODIES: &[&str] = &[
             "hello", "123", "abc123", "won't", "___", "   ", "!!!", "Hello", "aB", "HELLO",
             "a_b_c", "3.14", "e.g.", "x", "",
+            // numbers and non-word-like runs spread across several tokens, deep into the window.
+            // Listed before the capital bodies so their failures aren't cut off by `take(10)`.
+            "the 1 brown 22 jumps 333 over 4444 lazy 55555 again 6 now 77",
+            "a 1.5 b 2,000 c 3.14.15 d 42 e 7 f 99 g 100 h 8 i 0 j 12",
+            "123 !!! 456 ___ 789 ... 012 --- 345 ??? 678 ,,, 901 ;;; 23",
+            "x!y 12!34 ab!!cd 5?6 ef...gh 7--8 ij__kl 9 mn 0 op 3.4 qr",
             // capitals spread across several tokens, deep into the window
+            "A1 b2 C3 d4 E5 f6 G7 h8 I9 j0 K1 l2 M3 n4 O5 p6 Q7 r8 S9",
             "the Quick brown Fox jumps over the lazy Dog again now",
             "one Two three Four five Six seven Eight nine Ten more",
             "a B c D e F g H i J k L m N o P q R s T u V w X y Z b",
