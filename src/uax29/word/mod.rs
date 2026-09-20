@@ -177,6 +177,7 @@ pub fn table_lookup32(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> 
 #[inline(always)]
 pub fn load_byte_info(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> (uint8x16_t, uint8x16_t) {
     unsafe {
+        // println!("{}", std::str::from_utf8(bytes).unwrap());
         let first = table_lookup32(top, bottom, &bytes[0..16]);
         let second = table_lookup32(top, bottom, &bytes[16..32]);
         
@@ -305,19 +306,22 @@ pub fn maybe_process_ascii_window_neon32(
         word_like_vector = vextq_u8::<1>(word_like_vector, vdupq_n_u8(0));
         let word_like = move_nibble_mask(word_like_vector);
 
-        let window_bytes = &bytes[pos-2..(pos-2 + 32)];
+        let window_bytes = &bytes[pos..(pos + 32)];
         let first = vld1q_u8(window_bytes.as_ptr());
         let second = vld1q_u8(window_bytes.as_ptr().add(16));
         let mut is_first_upper = vcleq_u8(vsubq_u8(first, vdupq_n_u8(b'A')), vdupq_n_u8(b'Z' - b'A'));
         is_first_upper = vandq_u8(is_first_upper, vdupq_n_u8(0x01));
-        is_first_upper = vorrq_u8(is_first_upper, vshlq_n_u8::<4>(vextq_u8::<1>(is_first_upper, vdupq_n_u8(0))));
-        is_first_upper = vextq_u8::<2>(is_first_upper, vdupq_n_u8(0));
+        let first_even_tokens = vuzp1q_u8(is_first_upper, is_first_upper);
+        let first_odd_tokens = vuzp2q_u8(is_first_upper, is_first_upper);
+        is_first_upper = vsliq_n_u8::<4>(first_even_tokens, first_odd_tokens);
         
         let mut is_second_upper = vcleq_u8(vsubq_u8(second, vdupq_n_u8(b'A')), vdupq_n_u8(b'Z' - b'A'));
         is_second_upper = vandq_u8(is_second_upper, vdupq_n_u8(0x01));
-        is_second_upper = vorrq_u8(is_second_upper, vshlq_n_u8::<4>(vextq_u8::<1>(is_second_upper, vdupq_n_u8(0))));
+        let second_even_tokens = vuzp1q_u8(is_second_upper, is_second_upper);
+        let second_odd_tokens = vuzp2q_u8(is_second_upper, is_second_upper);
+        is_second_upper = vsliq_n_u8::<4>(second_even_tokens, second_odd_tokens);
 
-        let full_upper = vorrq_u8(is_first_upper, vextq_u8::<8>(vdupq_n_u8(0), is_second_upper));
+        let full_upper =  vcombine_u8(vget_low_u8(is_first_upper), vget_low_u8(is_second_upper));
         let ascii_upper = move_nibble_mask(full_upper);
         
         Some(WindowTokens {
@@ -521,6 +525,28 @@ pub fn tokenize_windowed(
     tokenize_windowed_with::<Scalar, _>(text, options, on_breakpoint);
 }
 
+/// Prints `bytes[pos..pos + window_size]` with the window's bitmaps lined up underneath, LSB first,
+/// so column `i` describes `bytes[pos + i]`. Non-printable bytes render as `.` to keep the columns
+/// honest. Note that only `breaks` and `word_like` are one bit per byte; `ascii_upper` currently
+/// comes back two bits per byte, so its columns do not line up with the text.
+#[cold]
+#[inline(never)]
+fn debug_window(bytes: &[u8], pos: usize, window_size: usize, res: &WindowTokens) {
+    let window: String = bytes[pos..pos + window_size]
+        .iter()
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .collect();
+    let bits = |mask: u32| -> String {
+        (0..window_size)
+            .map(|i| if (mask >> i) & 1 == 1 { '1' } else { '0' })
+            .collect()
+    };
+    eprintln!("{window} @{pos}");
+    eprintln!("{} breaks", bits(res.breaks));
+    eprintln!("{} word_like", bits(res.word_like));
+    eprintln!("{} upper", bits(res.ascii_upper));
+}
+
 pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenProperties) -> bool>(
     text: &str,
     _options: Options,
@@ -555,6 +581,7 @@ pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenPropertie
             let mut last_break = 0;
             while pos + P::WINDOW_SIZE + 3 < bytes.len() {
                 if let Some(res) = processor.process(bytes, pos) {
+                    // debug_window(bytes, pos, P::WINDOW_SIZE, &res);
                     let mut breaks = res.breaks;
 
                     let mut start = 0;
@@ -582,10 +609,10 @@ pub fn tokenize_windowed_with<P: WindowProcessor, F: FnMut(usize, TokenPropertie
                     // handoff to the next window, we will need to handoff tokenprops
                     // Process the next window
 
-                    // handoof token props to continue into the next window
+                    // handoff token props to continue into the next window
                     // we already zero'd out other tokens so theres no mask required
                     let prop_mask: u32 = ((1u32 << 29) - (1u32 << start)) as u32;
-                    token_props.0 = ((res.word_like & prop_mask != 0) as u8).wrapping_neg()
+                    token_props.0 |= ((res.word_like & prop_mask != 0) as u8).wrapping_neg()
                         & TokenProperties::WORD_LIKE_MASK;
                     token_props.0 |= ((res.ascii_upper & prop_mask != 0) as u8).wrapping_neg()
                         & TokenProperties::HAS_ASCII_UPPER_MASK;
@@ -1531,6 +1558,90 @@ mod tests {
         );
     }
 
+    /// `shl_nibble` and `shr_nibble` are `<< 1` and `>> 1` in *position* space, for vectors packed
+    /// the way `load_byte_info_packs_register_order` pins: position `p` lives in nibble `p`
+    /// counting from the least significant nibble. Moving one position is therefore a shift of the
+    /// whole register by one nibble, zero-filling the vacated end.
+    ///
+    /// The input is a ramp with every nibble distinct within its half, so a shift that moved by a
+    /// whole byte, or that swapped a lane's two nibbles, shows up directly in the output.
+    ///
+    /// The expectations are themselves pinned to that definition before the intrinsics run against
+    /// them, so they are not a snapshot of whatever the implementation happens to emit.
+    ///
+    /// Both functions are nested inside the `maybe_process_ascii_window_neon*` bodies, so they are
+    /// copied here verbatim rather than called: this pins what the intrinsic sequence means, and
+    /// will not notice if the kernel's own copies are edited.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn nibble_shifts_move_one_position() {
+        use std::arch::aarch64::*;
+
+        #[inline(always)]
+        unsafe fn shl_nibble(v: uint8x16_t) -> uint8x16_t {
+            let nxt = vextq_u8::<15>(vdupq_n_u8(0), v);
+            vsriq_n_u8::<4>(vshlq_n_u8::<4>(v), nxt)
+        }
+
+        #[inline(always)]
+        unsafe fn shr_nibble(v: uint8x16_t) -> uint8x16_t {
+            let prv = vextq_u8::<1>(v, vdupq_n_u8(0));
+            vsliq_n_u8::<4>(vshrq_n_u8::<4>(v), prv)
+        }
+
+        // nibbles 1,2,3,...,F,0 then 0,1,2,...,F, low nibble of each lane first.
+        const INPUT: [u8; 16] = [
+            0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB, 0xED, 0x0F, 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA,
+            0xDC, 0xFE,
+        ];
+        // Every nibble one place up; position 0 zero-filled, the old position 31 dropped.
+        const WANT_SHL: [u8; 16] = [
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x00, 0x21, 0x43, 0x65, 0x87, 0xA9,
+            0xCB, 0xED,
+        ];
+        // Every nibble one place down; position 31 zero-filled, the old position 0 dropped.
+        const WANT_SHR: [u8; 16] = [
+            0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x00, 0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB,
+            0xED, 0x0F,
+        ];
+
+        // Pin the two constants to the packing definition first, the way this module's other
+        // vector test pins `ASCII_CUSTOM_BYTE` before trusting its expectations. Read
+        // little-endian, the 16 lanes are one u128 whose nibble `p` holds position `p`, so moving
+        // a position is exactly `<< 4` / `>> 4`. That shares no reasoning with the
+        // vext/vsri/vsli sequence below, so agreement between the two is real evidence rather
+        // than the implementation confirming itself.
+        assert_eq!(
+            WANT_SHL,
+            (u128::from_le_bytes(INPUT) << 4).to_le_bytes(),
+            "WANT_SHL is not INPUT moved one nibble up"
+        );
+        assert_eq!(
+            WANT_SHR,
+            (u128::from_le_bytes(INPUT) >> 4).to_le_bytes(),
+            "WANT_SHR is not INPUT moved one nibble down"
+        );
+
+        let apply = |f: unsafe fn(uint8x16_t) -> uint8x16_t| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            unsafe {
+                vst1q_u8(out.as_mut_ptr(), f(vld1q_u8(INPUT.as_ptr())));
+            }
+            out
+        };
+
+        assert_eq!(
+            apply(shl_nibble),
+            WANT_SHL,
+            "shl_nibble did not move every nibble one position up\n  in   {INPUT:02X?}\n  want {WANT_SHL:02X?}"
+        );
+        assert_eq!(
+            apply(shr_nibble),
+            WANT_SHR,
+            "shr_nibble did not move every nibble one position down\n  in   {INPUT:02X?}\n  want {WANT_SHR:02X?}"
+        );
+    }
+
     /// Minimal input that panics the windowed tokenizer.
     ///
     /// The `.` is at offset 31, the last position of the only window, so the handoff hands the
@@ -2123,14 +2234,25 @@ mod tests {
     ///
     /// The padded sweep only shows the first differing emit per input; this lists every differing
     /// emit next to the token that closed there, so the pattern of which tokens gain or lose a
-    /// bit is visible. Expectations come from `tokenize`, so `INPUT` can be swapped for any case the
-    /// sweep reports.
+    /// bit is visible. Expectations come from `tokenize`, so the input can be swapped for any case
+    /// the sweep reports.
+    ///
+    /// This is that sweep's `capital_sweep` at `k = 0`, `pad = 0`, built the same way so the two
+    /// stay in step, and it is the case the name claims. The token spans [3, 73) with its only
+    /// capital at 3; the windows are [2, 31), [31, 60) and [60, 89). Window [31, 60) therefore
+    /// falls entirely inside the token and contains no break of its own, and the token does not
+    /// close until [60, 89), so the bit has to be carried across a window rather than recomputed
+    /// in it. Straddling a boundary is not enough on its own: a token that opens inside a window
+    /// leaves a break there for the properties to be recomputed from.
     #[test]
     fn windowed_token_props_ascii_upper_across_windows() {
         use super::TokenProperties;
 
-        const INPUT: &str =
-            "the Quick brown fox jumps over the l";
+        // "ab " lead, the capital, filler out to a 70-byte token, then the sweep's shared tail.
+        // Without the lead the token would start the input, where the ASCII word-run swallows it
+        // before the window path engages at `MIN_POS`.
+        let input = format!("ab B{} the quick brown fox jumps over it", "c".repeat(69));
+        let input = input.as_str();
 
         // (breakpoint, raw TokenProperties bits)
         // bit 0 = WORD_LIKE, bit 1 = NON_ASCII, bit 2 = HAS_ASCII_UPPER
@@ -2146,8 +2268,8 @@ mod tests {
             out
         }
 
-        let want = run(|s, o, cb| tokenize(s, o, cb), INPUT);
-        let got = run(|s, o, cb| tokenize_windowed(s, o, cb), INPUT);
+        let want = run(|s, o, cb| tokenize(s, o, cb), input);
+        let got = run(|s, o, cb| tokenize_windowed(s, o, cb), input);
 
         if want != got {
             let fmt = |e: Option<&(usize, u8)>| match e {
@@ -2160,7 +2282,7 @@ mod tests {
                 let (w, g) = (want.get(i), got.get(i));
                 // The token that just closed, cut at the oracle's breakpoints.
                 let tok = match w {
-                    Some(&(bp, _)) => &INPUT[std::mem::replace(&mut prev, bp)..bp],
+                    Some(&(bp, _)) => &input[std::mem::replace(&mut prev, bp)..bp],
                     None => "",
                 };
                 if w == g {
@@ -2172,7 +2294,7 @@ mod tests {
                     fmt(g),
                 ));
             }
-            panic!("{INPUT:?}\n{report}");
+            panic!("{input:?}\n{report}");
         }
     }
 
@@ -2338,6 +2460,10 @@ mod tests {
     ///
     /// Expectations come from `tokenize` rather than being written out, because padding changes
     /// both the offsets and which token each body merges into.
+    ///
+    /// Three things the window handoff has to get right are covered deliberately: a token that
+    /// continues across a window boundary, a capital sitting in the window on either side of that
+    /// boundary, and a non-ASCII island that forces window -> scalar -> window.
     #[test]
     fn windowed_token_props_on_padded_ascii() {
         // Bodies from `tokenizer_word_like_ascii_sanity`, plus uppercase and boundary-straddling
@@ -2363,6 +2489,19 @@ mod tests {
             "a B c D e F g H i J k L m N o P q R s T u V w X y Z b",
             "ABC def GHI jkl MNO pqr STU vwx YZa bcd EFG hij KLM no",
             "hello WORLD hello WORLD hello WORLD hello WORLD hello",
+            // Window -> scalar -> window. A non-ASCII byte anywhere in the 32-byte span makes
+            // `process` return `None`, so the window loop breaks, the scalar path walks the
+            // island, and the fast path has to re-engage afterwards. Both sides are longer than a
+            // window so there is real windowed work either side of the break, and capitals sit on
+            // both sides so the properties have to survive the transition in both directions.
+            "alpha Bravo charlie delta Echo foxtrot golf é hotel India juliet kilo Lima mike now",
+            "Quick brown fox jumps over the lazy Dog ☃ again and again now and then again",
+            // The non-ASCII inside a token rather than between two, so the handoff lands mid-token
+            // and the scalar path has to pick up a token the window had already started.
+            "aaaa Bbbb cccc dddd eeee ffff gggg hhhhé iiii Jjjj kkkk llll mmmm nnnn oooo pppp",
+            "ABCDEFGH ijklmnop QRSTUVWX yzabcdef ghijklmn é GHIJKLMN opqrstuv WXYZabcd MNOP",
+            // Two islands, so the fast path has to re-engage twice rather than once.
+            "one Two three é four Five six seven Eight nine ☃ ten Eleven twelve thirteen Fourteen",
         ];
         const PADS: &[usize] = &[0, 1, 2, 3, 5, 8, 13, 15, 16, 17, 31, 33];
         const TAIL: &str = " the quick brown fox jumps over it";
@@ -2383,9 +2522,50 @@ mod tests {
             out
         }
 
+        // `PADS` shifts the whole input, but `"a".repeat(pad)` is word-continue and merges into
+        // the body's leading run, so the scalar pre-pass consumes the merged run and the first
+        // window opens at the same *body-relative* offset for every pad. The window grid therefore
+        // never moves against the body, and a boundary-straddling case written as a literal only
+        // ever gets tested at one alignment. These two groups sweep inside the body instead, which
+        // does move the interesting byte against the grid.
+        const SWEEP_LEN: usize = 70;
+
+        // Both sweeps lead with a short word. A long token at the very start of the input never
+        // reaches the window path: at `pos == 1` the fast path is skipped for `pos < MIN_POS`, and
+        // the ASCII word-run below then consumes the whole token in one go. The leading `"ab "`
+        // gets the window loop running first, so the long token is crossed by windows rather than
+        // swallowed before they start.
+        const LEAD: &str = "ab ";
+
+        // One token long enough to span several windows, with a single capital at every offset it
+        // can occupy. Some `k` puts the capital in the window *before* a boundary the token
+        // crosses and some puts it in the window *after*, so the carry has to hold the bit across
+        // the handoff in the first case and must not invent one in the second.
+        let capital_sweep = (0..SWEEP_LEN)
+            .map(|k| format!("{LEAD}{}B{}", "a".repeat(k), "c".repeat(SWEEP_LEN - 1 - k)));
+
+        // Two capitals in the same long token, far enough apart to land in different windows, so a
+        // carry that overwrites instead of accumulating is caught: dropping either one still has
+        // to change the reported properties of the token that encloses both.
+        let two_capitals = (0..SWEEP_LEN - 24).map(|k| {
+            format!(
+                "{LEAD}{}B{}C{}",
+                "a".repeat(k),
+                "d".repeat(22),
+                "e".repeat(SWEEP_LEN - 24 - k)
+            )
+        });
+
+        let bodies: Vec<String> = BODIES
+            .iter()
+            .map(|b| (*b).to_string())
+            .chain(capital_sweep)
+            .chain(two_capitals)
+            .collect();
+
         let mut failures = Vec::new();
         let mut checked = 0usize;
-        for body in BODIES {
+        for body in &bodies {
             for &pad in PADS {
                 let input = format!("{}{body}{TAIL}", "a".repeat(pad));
                 let want = run(|s, o, cb| tokenize(s, o, cb), &input);
