@@ -9,7 +9,7 @@ use alyze::analyze::{
     StopwordRemoval, TokenizerOptions,
 };
 use alyze::uax29;
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use parquet::{
     file::reader::{FileReader, SerializedFileReader},
     record::{Row, RowAccessor, reader::RowIter},
@@ -18,6 +18,57 @@ use parquet::{
 
 criterion_group!(benches, wikipedia_benchmark, analysis_benchmark);
 criterion_main!(benches);
+
+/// Stamps out the word-break benchmarks for one tokenizer.
+///
+/// A macro rather than a `&[(&str, fn(..))]` table on purpose: the callback is invoked once per
+/// token, so routing it through `&mut dyn FnMut` to make the tokenizers share a signature would
+/// add a virtual call to the hottest loop in the measurement. Taking the tokenizer as a path
+/// keeps every call statically dispatched and inlinable, exactly as a real caller would get.
+macro_rules! word_break_benches {
+    ($group:expr, $texts:expr, $name:expr, $tokenize:path $(,)?) => {{
+        $group.bench_function(BenchmarkId::new("word break", $name), |b| {
+            b.iter(|| {
+                let mut acc = 0u64;
+                for text in $texts {
+                    $tokenize(text, uax29::word::Options::default(), |bp, _| {
+                        // Fold `bp` in rather than `count += 1`. A bare increment driven by the
+                        // window's break mask is reducible to `count += mask.count_ones()`, and
+                        // LLVM does exactly that — it emits `cnt.8b`/`addv.8b` and deletes the
+                        // per-token loop, so the row stops measuring per-token dispatch. Summing
+                        // the breakpoint costs the same single add and cannot be folded into a
+                        // popcount, because the value depends on which bit was set, not how many.
+                        acc = acc.wrapping_add(bp as u64);
+                        true
+                    });
+                }
+                std::hint::black_box(&acc);
+            })
+        });
+
+        // When `props` is unused, LLVM will optimize it away (which is amazing!), but we also want
+        // to benchmark the cost of computing and using this word-like property.
+        $group.bench_function(BenchmarkId::new("word break + word_like", $name), |b| {
+            b.iter(|| {
+                let mut acc = 0u64;
+                let mut word_like = 0u64;
+                for text in $texts {
+                    $tokenize(text, uax29::word::Options::default(), |bp, props| {
+                        // `bp` folded into both accumulators for the reason above; the word_like
+                        // one matters just as much, since a bare `word_like += 1` under a flag
+                        // that the optimiser can hoist out of the loop collapses to a single add.
+                        acc = acc.wrapping_add(bp as u64);
+                        if props.is_word_like() {
+                            word_like = word_like.wrapping_add(bp as u64);
+                        }
+                        true
+                    });
+                }
+                std::hint::black_box((&acc, &word_like));
+            })
+        });
+    }};
+}
 
 pub fn wikipedia_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("wikipedia");
@@ -28,37 +79,77 @@ pub fn wikipedia_benchmark(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(n_bytes));
     group.sample_size(16);
 
-    group.bench_function("word break", |b| {
-        b.iter(|| {
-            let mut count = 0;
-            for text in &texts {
-                uax29::word::tokenize(text, uax29::word::Options::default(), |_, _| {
-                    count += 1;
-                    true
-                });
-            }
-            std::hint::black_box(&count);
-        })
-    });
+    word_break_benches!(group, &texts, "dfa", uax29::word::tokenize);
+    word_break_benches!(group, &texts, "windowed", uax29::word::tokenize_windowed);
+    // Same treatment as "windowed" above — same macro, same call shape, a plain fn rather than a
+    // turbofish — so the kernel is the only difference between the two rows.
+    #[cfg(target_arch = "aarch64")]
+    word_break_benches!(
+        group,
+        &texts,
+        "windowed neon16 fn",
+        uax29::word::tokenize_windowed_neon16,
+    );
 
-    // When `props` is unused, LLVM will optimize it away (which is amazing!), but we also want
-    // to benchmark the cost of computing and using this word-like property.
-    group.bench_function("word break + word_like", |b| {
-        b.iter(|| {
-            let mut count = 0;
-            let mut word_like = 0;
-            for text in &texts {
-                uax29::word::tokenize(text, uax29::word::Options::default(), |_, props| {
-                    count += 1;
-                    if props.is_word_like() {
-                        word_like += 1;
+    // One row per window kernel, all reading `props`, so they sit with the "+ word_like" rows
+    // rather than the breakpoints-only ones. ("windowed" above is `Neon32`, via the dispatch in
+    // `tokenize_windowed`.)
+    //
+    // These are also where the popcount collapse was found: with `count += 1` and
+    // `word_like += 1`, LLVM hoisted the flag test out of the loop and replaced the rest with
+    // `count += breaks.count_ones()` (`cnt.8b` + `addv.8b`), so the row measured no per-token work
+    // at all. Folding `bp` into both accumulators is what keeps it honest.
+    #[cfg(target_arch = "aarch64")]
+    macro_rules! kernel_bench {
+        ($name:expr, $processor:ty) => {
+            // Breakpoints only, for comparison against the "word break" rows above.
+            group.bench_function(BenchmarkId::new("word break", $name), |b| {
+                b.iter(|| {
+                    let mut acc = 0u64;
+                    for text in &texts {
+                        uax29::word::tokenize_windowed_with::<$processor, _>(
+                            text,
+                            uax29::word::Options::default(),
+                            |bp, _| {
+                                acc = acc.wrapping_add(bp as u64);
+                                true
+                            },
+                        );
                     }
-                    true
-                });
-            }
-            std::hint::black_box((&count, &word_like));
-        })
-    });
+                    std::hint::black_box(&acc);
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("word break + word_like", $name), |b| {
+                b.iter(|| {
+                    let mut acc = 0u64;
+                    let mut word_like = 0u64;
+                    for text in &texts {
+                        uax29::word::tokenize_windowed_with::<$processor, _>(
+                            text,
+                            uax29::word::Options::default(),
+                            |bp, props| {
+                                acc = acc.wrapping_add(bp as u64);
+                                if props.is_word_like() {
+                                    word_like = word_like.wrapping_add(bp as u64);
+                                }
+                                true
+                            },
+                        );
+                    }
+                    std::hint::black_box(&acc);
+                    std::hint::black_box(&word_like);
+                })
+            });
+        };
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    kernel_bench!("windowed neon", uax29::word::Neon);
+    #[cfg(target_arch = "aarch64")]
+    kernel_bench!("windowed neon16", uax29::word::Neon16);
+    #[cfg(target_arch = "aarch64")]
+    kernel_bench!("windowed neon32", uax29::word::Neon32);
 
     group.bench_function("sentence break", |b| {
         b.iter(|| {
