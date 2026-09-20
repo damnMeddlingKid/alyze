@@ -81,39 +81,75 @@ pub fn wikipedia_benchmark(c: &mut Criterion) {
 
     word_break_benches!(group, &texts, "dfa", uax29::word::tokenize);
     word_break_benches!(group, &texts, "windowed", uax29::word::tokenize_windowed);
-
-    // The 16-byte `Neon` kernel. This closure reads `props`, so it belongs with the
-    // "+ word_like" rows, not the breakpoints-only ones.
-    //
-    // It is also where the popcount collapse was found: with `count += 1` and `word_like += 1`,
-    // LLVM hoisted the flag test out of the loop and replaced the rest with
-    // `count += breaks.count_ones()` (`cnt.8b` + `addv.8b`), so the row measured no per-token
-    // work at all. Folding `bp` into both accumulators is what keeps it honest.
+    // Same treatment as "windowed" above — same macro, same call shape, a plain fn rather than a
+    // turbofish — so the kernel is the only difference between the two rows.
     #[cfg(target_arch = "aarch64")]
-    group.bench_function(
-        BenchmarkId::new("word break + word_like", "windowed neon"),
-        |b| {
-            b.iter(|| {
-                let mut acc = 0u64;
-                let mut word_like = 0u64;
-                for text in &texts {
-                    uax29::word::tokenize_windowed_with::<uax29::word::Neon, _>(
-                        text,
-                        uax29::word::Options::default(),
-                        |bp, props| {
-                            acc = acc.wrapping_add(bp as u64);
-                            if props.is_word_like() {
-                                word_like = word_like.wrapping_add(bp as u64);
-                            }
-                            true
-                        },
-                    );
-                }
-                std::hint::black_box(&acc);
-                std::hint::black_box(&word_like);
-            })
-        },
+    word_break_benches!(
+        group,
+        &texts,
+        "windowed neon16 fn",
+        uax29::word::tokenize_windowed_neon16,
     );
+
+    // One row per window kernel, all reading `props`, so they sit with the "+ word_like" rows
+    // rather than the breakpoints-only ones. ("windowed" above is `Neon32`, via the dispatch in
+    // `tokenize_windowed`.)
+    //
+    // These are also where the popcount collapse was found: with `count += 1` and
+    // `word_like += 1`, LLVM hoisted the flag test out of the loop and replaced the rest with
+    // `count += breaks.count_ones()` (`cnt.8b` + `addv.8b`), so the row measured no per-token work
+    // at all. Folding `bp` into both accumulators is what keeps it honest.
+    #[cfg(target_arch = "aarch64")]
+    macro_rules! kernel_bench {
+        ($name:expr, $processor:ty) => {
+            // Breakpoints only, for comparison against the "word break" rows above.
+            group.bench_function(BenchmarkId::new("word break", $name), |b| {
+                b.iter(|| {
+                    let mut acc = 0u64;
+                    for text in &texts {
+                        uax29::word::tokenize_windowed_with::<$processor, _>(
+                            text,
+                            uax29::word::Options::default(),
+                            |bp, _| {
+                                acc = acc.wrapping_add(bp as u64);
+                                true
+                            },
+                        );
+                    }
+                    std::hint::black_box(&acc);
+                })
+            });
+
+            group.bench_function(BenchmarkId::new("word break + word_like", $name), |b| {
+                b.iter(|| {
+                    let mut acc = 0u64;
+                    let mut word_like = 0u64;
+                    for text in &texts {
+                        uax29::word::tokenize_windowed_with::<$processor, _>(
+                            text,
+                            uax29::word::Options::default(),
+                            |bp, props| {
+                                acc = acc.wrapping_add(bp as u64);
+                                if props.is_word_like() {
+                                    word_like = word_like.wrapping_add(bp as u64);
+                                }
+                                true
+                            },
+                        );
+                    }
+                    std::hint::black_box(&acc);
+                    std::hint::black_box(&word_like);
+                })
+            });
+        };
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    kernel_bench!("windowed neon", uax29::word::Neon);
+    #[cfg(target_arch = "aarch64")]
+    kernel_bench!("windowed neon16", uax29::word::Neon16);
+    #[cfg(target_arch = "aarch64")]
+    kernel_bench!("windowed neon32", uax29::word::Neon32);
 
     group.bench_function("sentence break", |b| {
         b.iter(|| {

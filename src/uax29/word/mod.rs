@@ -332,6 +332,106 @@ pub fn maybe_process_ascii_window_neon32(
     }
 }
 
+/// One position per *lane* instead of one per nibble.
+///
+/// `Neon32` packs two positions into each lane so that 32 bytes of token info fit in two
+/// registers, and pays for it with the nibble-granularity shifts (`shl_nibble` / `shr_nibble`,
+/// three instructions each) that `<< 1` and `>> 1` in position space then require. This kernel
+/// keeps the whole `ASCII_CUSTOM_BYTE` entry in its own lane, so moving a position is a single
+/// `ext`, and one register covers the window instead of two. The cost is span: 16 lanes hold two
+/// bytes of left context and one byte of lookahead, leaving a 13-byte window.
+///
+/// Lane `i` is byte `pos - 2 + i`, so lanes 2..=14 are the window and lane 15 is the lookahead
+/// that lane 14's rules need. Lane 15's own rules would need a byte this register does not hold,
+/// so its bit is masked off.
+#[inline(always)]
+pub fn maybe_process_ascii_window_neon16(
+    bytes: &[u8],
+    pos: usize,
+    top: uint8x16x4_t,
+    bottom: uint8x16x4_t,
+) -> Option<WindowTokens> {
+    /// Gathers bit 0 of each lane into a 16-bit mask, lane `i` landing at bit `i`. Every lane must
+    /// be 0 or 1. The multiply is the usual byte-to-bit gather: the constant's byte `j` is
+    /// `1 << (7 - j)`, so the products of the set lanes accumulate, one per bit, in the top byte.
+    #[inline(always)]
+    unsafe fn lane_bit_mask(v: uint8x16_t) -> u32 {
+        const GATHER: u64 = 0x0102_0408_1020_4080;
+        let u = vreinterpretq_u64_u8(v);
+        let lo = vgetq_lane_u64::<0>(u).wrapping_mul(GATHER) >> 56;
+        let hi = vgetq_lane_u64::<1>(u).wrapping_mul(GATHER) >> 56;
+        ((hi << 8) | lo) as u32
+    }
+
+    unsafe {
+        let raw = vld1q_u8(bytes.as_ptr().add(pos - 2));
+        // One horizontal max instead of `Neon32`'s byte-at-a-time OR: any lane with the high bit
+        // set means the window is not pure ASCII and the table lookup below would be meaningless.
+        if vmaxvq_u8(raw) >= 0x80 {
+            return None;
+        }
+
+        // `ASCII_CUSTOM_BYTE` split across two tbl4s: indices outside 0..64 return zero, so the
+        // top table covers 0..64 and the bottom covers 64..128 after the bias.
+        let info = vorrq_u8(
+            vqtbl4q_u8(top, raw),
+            vqtbl4q_u8(bottom, vsubq_u8(raw, vdupq_n_u8(64))),
+        );
+
+        // bit 0 letter, 1 mid_num, 2 extend, 3 mid_let, 4 numeric, 5 cr, 6 lf, 7 wseg.
+        let zero = vdupq_n_u8(0);
+        let prev = vextq_u8::<15>(zero, info); // lane i holds info[i - 1]
+        let next = vextq_u8::<1>(info, zero); // lane i holds info[i + 1]
+
+        // Every rule lands in bit 0 of its lane; the upper bits collect garbage from the shifted
+        // operands and are dropped by the mask against 1 below, exactly as `Neon32` does.
+
+        // (previous1 == ALetter) & (current == MidLetter) & (next == ALetter) // WB6
+        let wb6 = vandq_u8(vandq_u8(prev, vshrq_n_u8::<3>(info)), next);
+        // ...and the same span seen from its right-hand side // WB7
+        let wb6wb7 = vorrq_u8(wb6, vextq_u8::<15>(zero, wb6));
+
+        // (previous1 == Numeric) & (current == MidNum) & (next == Numeric) // WB12
+        let wb12 = vandq_u8(
+            vandq_u8(vshrq_n_u8::<4>(prev), vshrq_n_u8::<1>(info)),
+            vshrq_n_u8::<4>(next),
+        );
+        let wb11wb12 = vorrq_u8(wb12, vextq_u8::<15>(zero, wb12));
+
+        // ExtendNumLet adjacency, and WSegSpace x WSegSpace // WB13a/b, WB3d
+        let adjacent = vandq_u8(info, prev);
+        let wbex1 = vshrq_n_u8::<2>(adjacent);
+        let wbwseg = vshrq_n_u8::<7>(adjacent);
+        // (previous1 == CR) & (current == LF) // WB3
+        let wbcrlf = vandq_u8(vshrq_n_u8::<6>(info), vshrq_n_u8::<5>(prev));
+
+        let do_not_break = vorrq_u8(
+            vorrq_u8(vorrq_u8(wb6wb7, wb11wb12), vorrq_u8(wbex1, wbwseg)),
+            wbcrlf,
+        );
+
+        let one = vdupq_n_u8(0x01);
+        // `bic` is `one & !do_not_break`, which both inverts and trims to bit 0 in one instruction.
+        let breaks_bits = vbicq_u8(one, do_not_break);
+        // Word-like is letter (bit 0) or numeric (bit 4).
+        let word_like_bits = vandq_u8(vorrq_u8(info, vshrq_n_u8::<4>(info)), one);
+        // Uppercase straight off the raw bytes: `b - b'A'` wraps below 'A', so one unsigned
+        // compare covers the whole range.
+        let upper_bits = vandq_u8(
+            vcleq_u8(vsubq_u8(raw, vdupq_n_u8(b'A')), vdupq_n_u8(b'Z' - b'A')),
+            one,
+        );
+
+        // Shift off the two lanes of left context and keep the 13 window positions.
+        const WINDOW: u32 = (1 << 13) - 1;
+        Some(WindowTokens {
+            breaks: (lane_bit_mask(breaks_bits) >> 2) & WINDOW,
+            word_like: (lane_bit_mask(word_like_bits) >> 2) & WINDOW,
+            ascii_upper: (lane_bit_mask(upper_bits) >> 2) & WINDOW,
+        })
+    }
+}
+
 #[inline(always)]
 pub fn maybe_process_ascii_window_neon(
     bytes: &[u8],
@@ -523,6 +623,20 @@ pub fn tokenize_windowed(
     tokenize_windowed_with::<Neon32, _>(text, options, on_breakpoint);
     #[cfg(not(target_arch = "aarch64"))]
     tokenize_windowed_with::<Scalar, _>(text, options, on_breakpoint);
+}
+
+/// `tokenize_windowed` pinned to the 13-byte `Neon16` kernel.
+///
+/// A plain entry point rather than a `tokenize_windowed_with::<Neon16, _>` turbofish at the call
+/// site, so a caller reaches it through the same shape of call as `tokenize_windowed` and the
+/// kernel is the only thing that differs between the two.
+#[cfg(target_arch = "aarch64")]
+pub fn tokenize_windowed_neon16(
+    text: &str,
+    options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    tokenize_windowed_with::<Neon16, _>(text, options, on_breakpoint);
 }
 
 /// Prints `bytes[pos..pos + window_size]` with the window's bitmaps lined up underneath, LSB first,
@@ -1291,6 +1405,37 @@ pub struct Neon32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct Neon16 {
+    top: uint8x16x4_t,
+    bottom: uint8x16x4_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl WindowProcessor for Neon16 {
+    const MIN_POS: usize = 2;
+    // 16 lanes minus two of left context and one of lookahead.
+    const WINDOW_SIZE: usize = 13;
+
+    #[inline(always)]
+    fn new() -> Self {
+        // SAFETY: table is 128 bytes; NEON is baseline on aarch64.
+        unsafe {
+            let p = ASCII_CUSTOM_BYTE.as_ptr();
+            Neon16 {
+                top: vld1q_u8_x4(p),
+                bottom: vld1q_u8_x4(p.add(64)),
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn process(&mut self, bytes: &[u8], pos: usize) -> Option<WindowTokens> {
+        maybe_process_ascii_window_neon16(bytes, pos, self.top, self.bottom)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 impl WindowProcessor for Neon32 {
     // `process` table-looks-up the preceding window to seed prev_lo/prev_hi.
     const MIN_POS: usize = 2;
@@ -1446,16 +1591,103 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_kernel_matches_dfa_rules() {
-        use crate::uax29::word::{Neon, Neon32};
+        use crate::uax29::word::{Neon, Neon16, Neon32};
 
         let mut failures = Vec::new();
         check_kernel_rules::<Neon>("Neon", &mut failures);
+        check_kernel_rules::<Neon16>("Neon16", &mut failures);
         check_kernel_rules::<Neon32>("Neon32", &mut failures);
 
         assert!(
             failures.is_empty(),
             "window rules disagree with the DFA:\n{}",
             failures.join("\n")
+        );
+    }
+
+    /// `Neon16` driven end to end through `tokenize_windowed_with`, breakpoints *and* properties,
+    /// against the DFA.
+    ///
+    /// `neon_kernel_matches_dfa_rules` only checks the kernel's `breaks` mask in isolation, which
+    /// says nothing about the handoffs either side of it or the property carry across windows. The
+    /// bodies are the padded sweep's, including a capital swept through a token long enough to
+    /// cover a whole 13-byte window end to end.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon16_matches_dfa_end_to_end() {
+        use super::{Neon16, TokenProperties, tokenize_windowed_with};
+
+        const BODIES: &[&str] = &[
+            "hello the quick brown fox jumps over it",
+            "can't stop o'neill won't go now",
+            "a.b.c d.e.f g.h.i j.k.l m.n o.p",
+            "1,234 5.67 89,012 3.4 56,78 9,01",
+            "foo_bar_baz a1b2c3 x_1 y_2 z_3 w_4",
+            "a\r\nb c\r\nd e\r\nf g\r\nh i\r\nj k\r\nl m",
+            "a  b   c    d  e   f    g  h   i  j",
+            "the Quick brown Fox jumps over the lazy Dog again now",
+            "ABC def GHI jkl MNO pqr STU vwx YZa bcd EFG hij KLM no",
+            "alpha Bravo charlie delta Echo foxtrot golf é hotel India juliet kilo Lima mike now",
+            "aaaa Bbbb cccc dddd eeee ffff gggg hhhhé iiii Jjjj kkkk llll mmmm nnnn oooo pppp",
+            "...,,,;;;__   !!!???",
+        ];
+
+        // A capital swept through a token that covers a whole window, the case the carry needs.
+        let swept = (0..40).map(|k| format!("ab {}B{} tail words here", "a".repeat(k), "c".repeat(39 - k)));
+        let bodies: Vec<String> = BODIES
+            .iter()
+            .map(|b| (*b).to_string())
+            .chain(swept)
+            .collect();
+
+        fn run(
+            tok: impl Fn(&str, Options, &mut dyn FnMut(usize, TokenProperties) -> bool),
+            s: &str,
+        ) -> Vec<(usize, u8)> {
+            let mut out = Vec::new();
+            tok(s, Options::default(), &mut |bp, props| {
+                out.push((bp, props.0));
+                true
+            });
+            out
+        }
+
+        let mut failures = Vec::new();
+        let mut checked = 0usize;
+        for body in &bodies {
+            for pad in 0..18 {
+                let input = format!("{}{body} the quick brown fox jumps over it", "a".repeat(pad));
+                let want = run(|s, o, cb| tokenize(s, o, cb), &input);
+                let got = run(
+                    |s, o, cb| tokenize_windowed_with::<Neon16, _>(s, o, cb),
+                    &input,
+                );
+                checked += 1;
+                if want != got {
+                    let first = want
+                        .iter()
+                        .zip(&got)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(want.len().min(got.len()));
+                    let fmt = |e: Option<&(usize, u8)>| match e {
+                        Some((bp, bits)) => format!("bp={bp} props={bits:#07b}"),
+                        None => "<no emit>".to_string(),
+                    };
+                    failures.push(format!(
+                        "  body={body:?} pad={pad}\n      first differing emit #{first}\n      \
+                         want {}\n       got {}",
+                        fmt(want.get(first)),
+                        fmt(got.get(first)),
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{}\n\n{} / {checked} inputs disagree with the DFA",
+            failures.iter().take(10).cloned().collect::<Vec<_>>().join("\n"),
+            failures.len(),
         );
     }
 
