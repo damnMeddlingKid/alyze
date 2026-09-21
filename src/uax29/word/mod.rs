@@ -100,6 +100,7 @@ pub fn load_byte_info(top: uint8x16x4_t, bottom: uint8x16x4_t, bytes: &[u8]) -> 
 }
 
 //Takes a mask of low nibbles and returns a 32 bit packed mask 
+#[inline(always)]
 pub unsafe fn move_nibble_mask(input: uint8x16_t) -> u32 {
     let mut mask = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(input));
     mask = (mask | (mask >> 3)) & 0x0303030303030303;
@@ -129,6 +130,7 @@ pub unsafe fn shr_nibble(v: uint8x16_t) -> uint8x16_t {
     vsliq_n_u8::<4>(vshrq_n_u8::<4>(v), prv)
 }
 
+#[inline(always)]
 pub fn maybe_process_ascii_window_neon32(
     bytes: &[u8],
     pos: usize,
