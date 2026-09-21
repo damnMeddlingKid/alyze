@@ -21,57 +21,6 @@ use parquet::{
 criterion_group!(benches, wikipedia_benchmark, analysis_benchmark);
 criterion_main!(benches);
 
-/// Stamps out the word-break benchmarks for one tokenizer.
-///
-/// A macro rather than a `&[(&str, fn(..))]` table on purpose: the callback is invoked once per
-/// token, so routing it through `&mut dyn FnMut` to make the tokenizers share a signature would
-/// add a virtual call to the hottest loop in the measurement. Taking the tokenizer as a path
-/// keeps every call statically dispatched and inlinable, exactly as a real caller would get.
-macro_rules! word_break_benches {
-    ($group:expr, $texts:expr, $name:expr, $tokenize:path $(,)?) => {{
-        $group.bench_function(BenchmarkId::new("word break", $name), |b| {
-            b.iter(|| {
-                let mut acc = 0u64;
-                for text in $texts {
-                    $tokenize(text, uax29::word::Options::default(), |bp, _| {
-                        // Fold `bp` in rather than `count += 1`. A bare increment driven by the
-                        // window's break mask is reducible to `count += mask.count_ones()`, and
-                        // LLVM does exactly that — it emits `cnt.8b`/`addv.8b` and deletes the
-                        // per-token loop, so the row stops measuring per-token dispatch. Summing
-                        // the breakpoint costs the same single add and cannot be folded into a
-                        // popcount, because the value depends on which bit was set, not how many.
-                        acc = acc.wrapping_add(bp as u64);
-                        true
-                    });
-                }
-                std::hint::black_box(&acc);
-            })
-        });
-
-        // When `props` is unused, LLVM will optimize it away (which is amazing!), but we also want
-        // to benchmark the cost of computing and using this word-like property.
-        $group.bench_function(BenchmarkId::new("word break + word_like", $name), |b| {
-            b.iter(|| {
-                let mut acc = 0u64;
-                let mut word_like = 0u64;
-                for text in $texts {
-                    $tokenize(text, uax29::word::Options::default(), |bp, props| {
-                        // `bp` folded into both accumulators for the reason above; the word_like
-                        // one matters just as much, since a bare `word_like += 1` under a flag
-                        // that the optimiser can hoist out of the loop collapses to a single add.
-                        acc = acc.wrapping_add(bp as u64);
-                        if props.is_word_like() {
-                            word_like = word_like.wrapping_add(bp as u64);
-                        }
-                        true
-                    });
-                }
-                std::hint::black_box((&acc, &word_like));
-            })
-        });
-    }};
-}
-
 pub fn wikipedia_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("wikipedia");
 
@@ -80,18 +29,54 @@ pub fn wikipedia_benchmark(c: &mut Criterion) {
 
     group.throughput(Throughput::Bytes(n_bytes));
     group.sample_size(16);
-    // One iteration chews through 64 MiB and takes ~100ms, so criterion's default linear sampling
-    // would need 1+2+...+16 = 136 iterations and warns that it cannot fit them in the measurement
-    // window. Linear sampling exists to amortise timer overhead on nanosecond-scale benchmarks and
-    // buys nothing at this scale; worse, its last sample runs 16 iterations back to back, so late
-    // samples are measured on a hotter machine than early ones — drift inside a single row. Flat
-    // sampling gives every sample the same small iteration count, which is both what criterion
-    // recommends above ~1ms per iteration and what keeps samples comparable to each other.
     group.sampling_mode(SamplingMode::Flat);
     group.measurement_time(std::time::Duration::from_secs(10));
 
-    word_break_benches!(group, &texts, "dfa", uax29::word::tokenize);
-    word_break_benches!(group, &texts, "windowed", uax29::word::tokenize_windowed);
+    // A macro rather than a loop over tokenizers: each takes `impl FnMut`, so sharing a signature
+    // would mean `&mut dyn FnMut` and a virtual call per token in the loop being measured.
+    macro_rules! word_break_benches {
+        ($name:expr, $tokenize:path) => {
+            group.bench_function(BenchmarkId::new("word break", $name), |b| {
+                b.iter(|| {
+                    let mut count = 0;
+                    for text in &texts {
+                        $tokenize(text, uax29::word::Options::default(), |bp, _| {
+                            // Sum the breakpoints rather than counting them. The windowed
+                            // tokenizer walks a bitmask of breaks per window, and a bare
+                            // `count += 1` over that loop is reducible to
+                            // `count += mask.count_ones()` — LLVM does exactly that, which skips
+                            // the per-token work this is meant to measure.
+                            count += bp as u64;
+                            true
+                        });
+                    }
+                    std::hint::black_box(&count);
+                })
+            });
+
+            // When `props` is unused, LLVM will optimize it away (which is amazing!), but we also
+            // want to benchmark the cost of computing and using this word-like property.
+            group.bench_function(BenchmarkId::new("word break + word_like", $name), |b| {
+                b.iter(|| {
+                    let mut count = 0;
+                    let mut word_like = 0;
+                    for text in &texts {
+                        $tokenize(text, uax29::word::Options::default(), |bp, props| {
+                            count += bp as u64;
+                            if props.is_word_like() {
+                                word_like += bp as u64;
+                            }
+                            true
+                        });
+                    }
+                    std::hint::black_box((&count, &word_like));
+                })
+            });
+        };
+    }
+
+    word_break_benches!("dfa", uax29::word::tokenize);
+    word_break_benches!("windowed", uax29::word::tokenize_windowed);
 
     group.bench_function("sentence break", |b| {
         b.iter(|| {
@@ -117,13 +102,6 @@ pub fn analysis_benchmark(c: &mut Criterion) {
 
     group.throughput(Throughput::Bytes(n_bytes));
     group.sample_size(16);
-    // One iteration chews through 64 MiB and takes ~100ms, so criterion's default linear sampling
-    // would need 1+2+...+16 = 136 iterations and warns that it cannot fit them in the measurement
-    // window. Linear sampling exists to amortise timer overhead on nanosecond-scale benchmarks and
-    // buys nothing at this scale; worse, its last sample runs 16 iterations back to back, so late
-    // samples are measured on a hotter machine than early ones — drift inside a single row. Flat
-    // sampling gives every sample the same small iteration count, which is both what criterion
-    // recommends above ~1ms per iteration and what keeps samples comparable to each other.
     group.sampling_mode(SamplingMode::Flat);
     group.measurement_time(std::time::Duration::from_secs(10));
 
